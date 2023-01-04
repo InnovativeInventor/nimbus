@@ -11,5 +11,6 @@
       fuse3
 
       busybox
+      tree
     ];
 }

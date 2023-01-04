@@ -22,7 +22,7 @@ fn main() {
 
     info!("Args parsed");
     fuser::mount2(
-        NimbusFS::default(args.local_storage),
+        NimbusFS::default(args.local_storage, args.mount_directory.clone()),
         args.mount_directory.to_str().unwrap(),
         &[MountOption::AutoUnmount],
     )
