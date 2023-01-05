@@ -1,15 +1,19 @@
+use nix::unistd::chown;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::fs::{File, FileTimes, OpenOptions};
-use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+use std::io::{Error, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::thread;
+// use std::thread;
 
 // todo: handle truncate flag
-use libc::{c_int, ENOENT, ENOSYS, EPERM, O_ACCMODE, O_APPEND, O_RDONLY, O_RDWR, O_WRONLY}; // O_EXEC, O_SEARCH,
+use libc::{
+    c_int, EISDIR, ENAMETOOLONG, ENOENT, ENOSYS, EPERM, O_ACCMODE, O_APPEND, O_RDONLY, O_RDWR,
+    O_WRONLY, PATH_MAX,
+}; // O_EXEC, O_SEARCH,
 use std::path::PathBuf;
 
 use chrono::prelude::*;
@@ -17,12 +21,13 @@ use std::time::{Duration, Instant, SystemTime};
 
 use fuser::TimeOrNow::{Now, SpecificTime};
 use fuser::{
-    FileAttr, Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
+    FileAttr, Filesystem, KernelConfig, Reply, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
 use log::{debug, error, info, trace, warn};
 
 use crate::convert::{convert_file_type, convert_metadata, parse_flag_options};
+use crate::fuse::Fuse;
 
 const ROOT_DIR: u64 = 1;
 const ATTR_TTL: Duration = Duration::new(1, 0);
@@ -50,7 +55,7 @@ pub struct NimbusFS {
     // pub attr_ttl: Duration,
     pub generation: u64,
 
-    /// Map containing inode-inode mappings
+    /// Map containing inode-pathbuf mappings
     ino_file_map: HashMap<u64, PathBuf>,
     file_ino_map: HashMap<PathBuf, u64>,
     // Last inode allocated
@@ -59,6 +64,7 @@ pub struct NimbusFS {
     file_handlers_map: HashMap<u64, Arc<Mutex<FileHandler>>>,
     /// An incrementing counter so we can generate unique file handle ids
     last_file_handle: u64,
+    // last_alloced_ino: u64,
 }
 
 impl NimbusFS {
@@ -78,6 +84,7 @@ impl NimbusFS {
             file_ino_map: HashMap::new(),
             file_handlers_map: HashMap::new(),
             last_file_handle: 0, // last_ino_alloc: ROOT_DIR,
+                                 // last_alloced_ino: ROOT_DIR,
         };
         nimbus.register_ino(
             ROOT_DIR,
@@ -85,6 +92,11 @@ impl NimbusFS {
         );
         nimbus
     }
+
+    // pub fn fresh_ino(&mut self) -> u64 {
+    //     self.last_alloced_ino += 1;
+    //     self.last_alloced_ino
+    // }
 
     pub fn register_ino(&mut self, ino: u64, path: PathBuf) {
         self.ino_file_map.insert(ino, path.clone());
@@ -133,6 +145,54 @@ impl NimbusFS {
         self.file_handlers_map.remove(&fh)
     }
 
+    // Result variants
+    pub fn lookup_ino_result(&self, ino: &u64) -> std::io::Result<&PathBuf> {
+        match self.ino_file_map.get(ino) {
+            Some(path) => Ok(path),
+            None => Err(Error::new(
+                ErrorKind::NotFound,
+                "ino lookup failed: ino not found",
+            )),
+        }
+    }
+
+    // todo: rename to lookup_path
+    pub fn lookup_file_result(&self, path: &PathBuf) -> std::io::Result<&u64> {
+        match self.file_ino_map.get(path) {
+            Some(ino) => Ok(ino),
+            None => Err(Error::new(
+                ErrorKind::NotFound,
+                "file lookup failed: file not found",
+            )),
+        }
+    }
+
+    pub fn lookup_file_handler_result(
+        &mut self,
+        fh: u64,
+    ) -> std::io::Result<&Arc<Mutex<FileHandler>>> {
+        match self.file_handlers_map.get(&fh) {
+            Some(fh) => Ok(fh),
+            None => Err(Error::new(
+                ErrorKind::NotFound,
+                "file handler lookup failed: file handler not found",
+            )),
+        }
+    }
+
+    pub fn delete_file_handler_result(
+        &mut self,
+        fh: u64,
+    ) -> std::io::Result<Arc<Mutex<FileHandler>>> {
+        match self.file_handlers_map.remove(&fh) {
+            Some(fh) => Ok(fh),
+            None => Err(Error::new(
+                ErrorKind::NotFound,
+                "file handler deletion failed: file handler not found",
+            )),
+        }
+    }
+
     pub fn count_file_handlers(&mut self) -> usize {
         self.file_handlers_map.len()
     }
@@ -140,6 +200,18 @@ impl NimbusFS {
     fn getattr_path(&self, path: &PathBuf) -> Result<FileAttr, std::io::Error> {
         let metadata = fs::symlink_metadata(path)?; // todo: better error handling
         Ok(convert_metadata(&metadata))
+    }
+}
+
+impl Fuse for NimbusFS {
+    fn duration(&mut self) -> Duration {
+        ATTR_TTL
+    }
+
+    fn getattr_fs(&mut self, req: &Request<'_>, ino: u64) -> std::io::Result<FileAttr> {
+        let mut attr = self.getattr_path(self.lookup_ino_result(&ino)?)?;
+        attr.ino = ino;
+        return Ok(attr);
     }
 }
 
@@ -160,7 +232,7 @@ impl Filesystem for NimbusFS {
                 }
                 Err(error) => match error.kind() {
                     ErrorKind::NotFound => reply.error(ENOENT),
-                    _ => todo!("Unimplemented error in getattr: {:?}", error),
+                    _ => crate::unhandled!("Unimplemented error in getattr: {:?}", error),
                 },
             }
         } else {
@@ -198,7 +270,7 @@ impl Filesystem for NimbusFS {
                                     good_entry.file_name(),
                                 );
                                 self.register_ino(good_metadata.ino(), good_entry.path()); // opportunistically add
-                                if result == true {
+                                if result {
                                     break;
                                 }
                             }
@@ -206,7 +278,7 @@ impl Filesystem for NimbusFS {
                     }
                 }
             }
-            debug!("{:?}", reply);
+            debug!("Replied with: {:?}", reply);
             reply.ok();
         } else {
             info!("Miss!");
@@ -229,7 +301,11 @@ impl Filesystem for NimbusFS {
                         info!("ENOENT returned for {:?}", file);
                         reply.error(ENOENT);
                     }
-                    _ => unimplemented!("Other error codes are unimplemented"),
+                    ErrorKind::InvalidFilename => {
+                        info!("ENAMETOOLONG returned for {:?}", file);
+                        reply.error(ENAMETOOLONG);
+                    }
+                    err => crate::unhandled!("Other error codes are unimplemented: {:?}", err),
                 },
             }
         } else {
@@ -353,12 +429,13 @@ impl Filesystem for NimbusFS {
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
         info!("Called open(ino: {:?}", ino);
         if let Some(file) = self.lookup_ino(&ino) {
+            info!("Hit (open()): {:?}", file);
             let options = parse_flag_options(flags);
             match options.open(file) {
                 Ok(fh) => reply.opened(self.register_file_handle(fh), 0), // todo: check if 0 is the right flag to return here
                 Err(error) => match error.kind() {
-                    // ErrorKind::NotFound => reply.error(ENOENT),
-                    _ => unimplemented!("Unimplemented open() error (open) with {:?}", error),
+                    ErrorKind::NotFound => reply.error(ENOENT),
+                    _ => crate::unhandled!("Unimplemented open() error (open) with {:?}", error),
                 },
             };
         }
@@ -381,9 +458,13 @@ impl Filesystem for NimbusFS {
         );
 
         if let Some(file) = self.parent_name_lookup(parent, name) {
-            let mut options = parse_flag_options(flags);
-            match options.create_new(true).open(file.clone()) {
+            // let mut options = parse_flag_options(flags);
+            match File::create_new(file.clone()) {
                 Ok(fh) => {
+                    // let now = Instant::now();
+                    // while (!file.exists()) && now.elapsed() < TIMEOUT {
+                    //     thread::sleep(SLEEP_INTERVAL);
+                    // }
                     match self.getattr_path(&file) {
                         Ok(attr) => {
                             info!("File created");
@@ -397,15 +478,22 @@ impl Filesystem for NimbusFS {
                             );
                         }
                         Err(err) => match err.kind() {
-                            _ => unimplemented!("Other error codes are unimplemented"),
+                            _ => crate::unhandled!(
+                                "create() error codes need to be implemented, {:?}",
+                                err
+                            ),
                         },
                     }
                 }
-                Err(_) => todo!(),
+                Err(err) => crate::unhandled!(
+                    "unhandled create() error {:?} with options {:?}",
+                    err,
+                    () // options
+                ),
             }
         } else {
             reply.error(ENOSYS);
-            unimplemented!("Unimplemented create() error (lookup)");
+            crate::unhandled!("Unimplemented create() error (lookup)");
         }
     }
 
@@ -461,26 +549,62 @@ impl Filesystem for NimbusFS {
         //             .expect("setattr() failed to set times");
         //     }
         if let Some(filename) = self.lookup_ino(&ino) {
-            if let Ok(file) = File::options().write(true).open(filename) {
-                file.set_times(times)
-                    .expect("setattr() failed to set times");
-                if let Some(mode_st) = mode {
-                    let mut perms = file
-                        .metadata()
-                        .expect("setattr() failed to fetch metadata")
-                        .permissions();
-                    perms.set_mode(mode_st);
+            match File::options().write(true).open(filename) {
+                Ok(file) => {
+                    file.set_times(times)
+                        .expect("setattr() failed to set times");
+                    if let Some(mode_st) = mode {
+                        let mut perms = file
+                            .metadata()
+                            .expect("setattr() failed to fetch metadata")
+                            .permissions();
+                        perms.set_mode(mode_st);
+                    }
+                    if let Some(len) = size {
+                        file.set_len(len).expect("setattr() failed to set size");
+                    }
+                    // let the file get closed here
+                    match chown(filename, uid.map(|x| x.into()), gid.map(|x| x.into())) {
+                        Ok(_) => self.getattr(req, ino, reply),
+                        Err(error) => {
+                            reply.error(ENOSYS);
+                            crate::unhandled!(
+                                "Unimplemented error handling in setattr(): {:?}",
+                                error
+                            )
+                        }
+                    }
+                    // todo: set uid, gid, etc.
                 }
-                if let Some(len) = size {
-                    file.set_len(len).expect("setattr() failed to set size");
-                }
-                self.getattr(req, ino, reply);
-            } else {
-                todo!("Unimplemented error handling in setattr()")
+                Err(error) => match error.kind() {
+                    ErrorKind::IsADirectory => {
+                        info!("Returned EISDIR for {:?}", filename);
+                        reply.error(EISDIR)
+                    }
+                    error => {
+                        reply.error(ENOSYS);
+                        crate::unhandled!("Unimplemented error handling in setattr(): {:?}", error)
+                    }
+                },
             }
-            // todo: set mode, uid, gid, size, etc.
         } else {
-            unimplemented!("Unimplemented error handling in setattr()")
+            crate::unhandled!("Unimplemented error handling in setattr()")
+        }
+    }
+
+    fn flush(&mut self, _req: &Request<'_>, ino: u64, fh: u64, lock_owner: u64, reply: ReplyEmpty) {
+        info!(
+            "flush(ino: {:#x?}, fh: {}, lock_owner: {:?})",
+            ino, fh, lock_owner
+        );
+        if let Some(f) = self.lookup_file_handler(fh) {
+            let arc_file_handler = Arc::clone(f);
+            let mut file_handler = arc_file_handler.lock().unwrap();
+            if file_handler.file.flush().is_ok() && file_handler.file.sync_all().is_ok() {
+                reply.ok();
+            }
+        } else {
+            reply.error(ENOSYS);
         }
     }
 
@@ -501,11 +625,11 @@ impl Filesystem for NimbusFS {
                 if f.file.flush().is_ok() && f.file.sync_all().is_ok() {
                     reply.ok();
                 } else {
-                    unimplemented!("Unimplemented error handling in release()");
+                    crate::unhandled!("Unimplemented error handling in release()");
                 }
             }
             None => {
-                unimplemented!("Unimplemented error handling in release()");
+                crate::unhandled!("Unimplemented error handling in release()");
             }
         }
 
@@ -539,11 +663,11 @@ impl Filesystem for NimbusFS {
                     self.lookup(req, parent, name, reply);
                 }
                 Err(_) => {
-                    todo!("Unimplemeneted error handling in mkdir()");
+                    crate::unhandled!("Unimplemeneted error handling in mkdir()");
                 }
             }
         } else {
-            unimplemented!("Unimplemeneted error handling in mkdir()");
+            crate::unhandled!("Unimplemeneted error handling in mkdir()");
         }
     }
 
@@ -554,11 +678,11 @@ impl Filesystem for NimbusFS {
             match fs::remove_dir(dir_path) {
                 Ok(_) => reply.ok(),
                 Err(_) => {
-                    todo!("Unimplemeneted error handling in mkdir()");
+                    crate::unhandled!("Unimplemeneted error handling in mkdir()");
                 }
             }
         } else {
-            unimplemented!("Unimplemeneted error handling in rmdir()");
+            crate::unhandled!("Unimplemeneted error handling in rmdir()");
         }
     }
 
@@ -582,14 +706,14 @@ impl Filesystem for NimbusFS {
                 match fs::rename(dir_path, new_dir_path) {
                     Ok(_) => reply.ok(),
                     Err(_) => {
-                        todo!("Unimplemeneted error handling in mkdir()");
+                        crate::unhandled!("Unimplemeneted error handling in mkdir()");
                     }
                 }
             } else {
-                todo!("Unimplemeneted error handling in mkdir()");
+                crate::unhandled!("Unimplemeneted error handling in mkdir()");
             }
         } else {
-            unimplemented!("Unimplemeneted error handling in rmdir()");
+            crate::unhandled!("Unimplemeneted error handling in rmdir()");
         }
     }
 
@@ -609,16 +733,12 @@ impl Filesystem for NimbusFS {
         if let Some(sym_path) = self.parent_name_lookup(parent, name) {
             match std::os::unix::fs::symlink(link, sym_path) {
                 Ok(_) => {
-                    // let now = Instant::now();
-                    // while (!sym_path.exists()) && now.elapsed() < TIMEOUT {
-                    //     thread::sleep(SLEEP_INTERVAL);
-                    // }
                     self.lookup(req, parent, name, reply);
                 }
-                Err(_) => todo!("Unimplemented error handling in symlink()"),
+                Err(_) => crate::unhandled!("Unimplemented error handling in symlink()"),
             }
         } else {
-            unimplemented!("Unimplemented error handling in symlink()");
+            crate::unhandled!("Unimplemented error handling in symlink()");
         }
     }
 
@@ -626,10 +746,10 @@ impl Filesystem for NimbusFS {
         if let Some(file_path) = self.parent_name_lookup(parent, name) {
             match fs::remove_file(file_path) {
                 Ok(_) => reply.ok(),
-                Err(_) => todo!("Unimplemented error handling in symlink()"),
+                Err(_) => crate::unhandled!("Unimplemented error handling in symlink()"),
             }
         } else {
-            unimplemented!("Unimplemented error handling in symlink()");
+            crate::unhandled!("Unimplemented error handling in symlink()");
         }
     }
 
@@ -645,7 +765,7 @@ impl Filesystem for NimbusFS {
                             .as_bytes(),
                     );
                 }
-                Err(_) => todo!(),
+                Err(_) => crate::unhandled!(),
             }
         } else {
             reply.error(ENOSYS);
@@ -657,11 +777,11 @@ impl Filesystem for NimbusFS {
     // }
 
     // fn opendir(&mut self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: ReplyOpen) {
-    //     unimplemented!("Unimplemented opendir() call");
+    //     crate::unhandled!("Unimplemented opendir() call");
     //     reply.opened(0, 0);
     // }
     // fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
-    //     unimplemented!("Unimplemented fstatfs() call");
+    //     crate::unhandled!("Unimplemented fstatfs() call");
     //     reply.statfs(0, 0, 0, 0, 0, 512, 255, 0);
     // }
 }
