@@ -13,3 +13,12 @@ macro_rules! unhandled {
         panic!("not handled: {}", format_args!($($arg)+))
     };
 }
+
+// #[macro_export]
+// macro_rules! breakpoint {
+//     (_) => {
+//         unsafe {
+//             std::intrinsics::breakpoint();
+//         }
+//     };
+// }

@@ -64,7 +64,7 @@ pub struct NimbusFS {
     file_handlers_map: HashMap<u64, Arc<Mutex<FileHandler>>>,
     /// An incrementing counter so we can generate unique file handle ids
     last_file_handle: u64,
-    // last_alloced_ino: u64,
+    last_ino_alloc: u64,
 }
 
 impl NimbusFS {
@@ -83,8 +83,8 @@ impl NimbusFS {
             ino_file_map: HashMap::new(),
             file_ino_map: HashMap::new(),
             file_handlers_map: HashMap::new(),
-            last_file_handle: 0, // last_ino_alloc: ROOT_DIR,
-                                 // last_alloced_ino: ROOT_DIR,
+            last_file_handle: 0,
+            last_ino_alloc: ROOT_DIR,
         };
         nimbus.register_ino(
             ROOT_DIR,
@@ -96,6 +96,11 @@ impl NimbusFS {
     pub fn register_ino(&mut self, ino: u64, path: PathBuf) {
         self.ino_file_map.insert(ino, path.clone());
         self.file_ino_map.insert(path, ino);
+    }
+
+    pub fn fresh_ino(&mut self) -> u64 {
+        self.last_ino_alloc += 1;
+        self.last_ino_alloc
     }
 
     pub fn register_file_handle(&mut self, file: std::fs::File) -> u64 {
@@ -110,11 +115,7 @@ impl NimbusFS {
         self.last_file_handle
     }
 
-    pub fn parent_name_lookup_result(
-        &mut self,
-        parent: u64,
-        name: &OsStr,
-    ) -> std::io::Result<PathBuf> {
+    pub fn parent_name_lookup_result(&self, parent: u64, name: &OsStr) -> std::io::Result<PathBuf> {
         let parent_file = self.lookup_ino_result(&parent)?;
         let mut file = parent_file.clone();
         file.push(name);
@@ -138,6 +139,34 @@ impl NimbusFS {
             None => Err(Error::new(
                 ErrorKind::NotFound,
                 "file lookup failed: file not found",
+            )),
+        }
+    }
+
+    pub fn lookup_or_create_path(&mut self, path: &PathBuf) -> u64 {
+        let result = self.file_ino_map.get(path);
+        match result {
+            Some(ino) => *ino,
+            None => {
+                let ino = self.fresh_ino();
+                self.register_ino(ino, path.clone());
+                ino
+            }
+        }
+    }
+
+    pub fn remove_path(&mut self, path: &PathBuf) -> std::io::Result<()> {
+        match self.file_ino_map.remove(path) {
+            Some(ino) => match self.ino_file_map.remove(&ino) {
+                Some(_) => Ok(()),
+                None => Err(Error::new(
+                    ErrorKind::NotFound,
+                    "path remove failed: ino not found",
+                )),
+            },
+            None => Err(Error::new(
+                ErrorKind::NotFound,
+                "path remove failed: file not found",
             )),
         }
     }
@@ -204,10 +233,9 @@ impl Fuse for NimbusFS {
         {
             let good_entry = entry?;
             let file_type = good_entry.file_type()?;
-            let metadata = good_entry.metadata()?;
-            self.register_ino(metadata.ino(), good_entry.path()); // opportunistically add
+            let ino = self.lookup_or_create_path(&good_entry.path());
             let result = reply.add(
-                metadata.ino(),
+                ino,
                 counter as i64 + 1,
                 convert_file_type(file_type),
                 good_entry.file_name(),
@@ -225,9 +253,13 @@ impl Fuse for NimbusFS {
         parent: u64,
         name: &OsStr,
     ) -> std::io::Result<FileAttr> {
+        info!("lookup: lookup called");
         let filename = self.parent_name_lookup_result(parent, name)?;
-        let attr = self.getattr_path(&filename)?;
-        self.register_ino(attr.ino, filename); // opportunistically add
+        info!("lookup: filename {:?}", filename);
+        let ino = self.lookup_or_create_path(&filename);
+        let mut attr = self.getattr_path(&filename)?;
+        attr.ino = ino;
+        info!("lookup: attr {:?}", attr);
         Ok(attr)
     }
 
@@ -244,20 +276,25 @@ impl Fuse for NimbusFS {
         let f = self.lookup_file_handler_result(fh)?;
         let arc_file_handler = Arc::clone(f);
         let mut file_handler = arc_file_handler.lock().unwrap();
-        let file_handler_offset = file_handler.offset;
 
         // Seek to position
+        // let file_handler_offset = file_handler.offset;
+        // file_handler.offset = file_handler // corrupt
+        //     .file
+        //     .seek(SeekFrom::Current(
+        //         (offset - file_handler_offset).try_into().expect("Overflow"),
+        //     ))?
+        //     .try_into()
+        //     .expect("Overflow");
         file_handler.offset = file_handler
             .file
-            .seek(SeekFrom::Current(
-                (offset - file_handler_offset).try_into().expect("Overflow"),
-            ))?
+            .seek(SeekFrom::Start(offset.try_into().expect("Overflow")))?
             .try_into()
             .expect("Overflow");
 
         // Read
         let mut data: Vec<u8> = vec![0; size.try_into().expect("Overflow")];
-        file_handler.file.read(&mut data);
+        file_handler.file.read(&mut data)?;
         Ok(data)
     }
     fn write_fs(
@@ -274,14 +311,19 @@ impl Fuse for NimbusFS {
         let f = self.lookup_file_handler_result(fh)?;
         let arc_file_handler = Arc::clone(f);
         let mut file_handler = arc_file_handler.lock().unwrap();
-        let file_handler_offset = file_handler.offset;
 
         // Seek to position
-        file_handler.offset = file_handler
+        // let file_handler_offset = file_handler.offset;
+        // file_handler.offset = file_handler // corrupt
+        //     .file
+        //     .seek(SeekFrom::Current(
+        //         (offset - file_handler_offset).try_into().expect("Overflow"),
+        //     ))?
+        //     .try_into()
+        //     .expect("Overflow");
+        file_handler.offset = file_handler // corrupt
             .file
-            .seek(SeekFrom::Current(
-                (offset - file_handler_offset).try_into().expect("Overflow"),
-            ))?
+            .seek(SeekFrom::Start(offset.try_into().expect("Overflow")))?
             .try_into()
             .expect("Overflow");
 
@@ -304,8 +346,9 @@ impl Fuse for NimbusFS {
     ) -> std::io::Result<FileCreate> {
         let filename = self.parent_name_lookup_result(parent, name)?;
         let fh = File::create_new(filename.clone())?;
-        let attr = self.getattr_path(&filename)?;
-        self.register_ino(attr.ino, filename);
+        let mut attr = self.getattr_path(&filename)?;
+        let ino = self.lookup_or_create_path(&filename);
+        attr.ino = ino;
         Ok(FileCreate::new(attr, self.register_file_handle(fh)))
     }
     fn setattr_fs(
@@ -404,7 +447,17 @@ impl Fuse for NimbusFS {
 
     fn rmdir_fs(&mut self, req: &Request<'_>, parent: u64, name: &OsStr) -> std::io::Result<()> {
         let dir_path = self.parent_name_lookup_result(parent, name)?;
-        fs::remove_dir(dir_path)
+        info!(
+            "rmdir: there are {:?} files in the dir",
+            fs::read_dir(dir_path.clone())?.count()
+        );
+        fs::remove_dir(dir_path.clone())?;
+        info!(
+            "removed! parent: {:?}, name: {:?}, path: {:?}",
+            parent, name, dir_path
+        );
+        // self.remove_path(&dir_path)?;
+        Ok(())
     }
     fn rename_fs(
         &mut self,
@@ -416,8 +469,13 @@ impl Fuse for NimbusFS {
         flags: u32,
     ) -> std::io::Result<()> {
         let dir_path = self.parent_name_lookup_result(parent, name)?;
+        // let ino = *self.lookup_file_result(&dir_path)?;
         let new_dir_path = self.parent_name_lookup_result(new_parent, new_name)?;
-        fs::rename(dir_path, new_dir_path)
+        fs::rename(dir_path.clone(), new_dir_path)?;
+        // self.remove_path(&dir_path)?;
+        let new_ino = self.fresh_ino();
+        self.register_ino(new_ino, dir_path);
+        Ok(())
     }
     fn symlink_fs(
         &mut self,
@@ -432,7 +490,9 @@ impl Fuse for NimbusFS {
     }
     fn unlink_fs(&mut self, req: &Request<'_>, parent: u64, name: &OsStr) -> std::io::Result<()> {
         let file_path = self.parent_name_lookup_result(parent, name)?;
-        fs::remove_file(file_path)
+        fs::remove_file(file_path.clone())?;
+        // self.remove_path(&file_path)?;
+        Ok(())
     }
     fn readlink_fs(&mut self, req: &Request<'_>, ino: u64) -> std::io::Result<std::path::PathBuf> {
         let file = self.lookup_ino_result(&ino)?;
@@ -609,7 +669,7 @@ impl Filesystem for NimbusFS {
 
     fn rmdir(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         match self.rmdir_fs(req, parent, name) {
-            Ok(attr) => reply.ok(),
+            Ok(_) => reply.ok(),
             Err(error) => reply.error(parse_error_cint(error)),
         }
     }

@@ -1,6 +1,6 @@
 use libc::{
-    c_int, EISDIR, ENAMETOOLONG, ENOENT, ENOSYS, EPERM, O_ACCMODE, O_APPEND, O_RDONLY, O_RDWR,
-    O_WRONLY, PATH_MAX,
+    c_int, EISDIR, ENAMETOOLONG, ENOENT, ENOSYS, ENOTEMPTY, EPERM, O_ACCMODE, O_APPEND, O_RDONLY,
+    O_RDWR, O_WRONLY, PATH_MAX,
 };
 
 use log::{debug, error, info, trace, warn};
@@ -9,6 +9,8 @@ use std::fs::FileType;
 use std::io::{ErrorKind, Result}; // O_EXEC, O_SEARCH,
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
+
+use crate::macros;
 
 use fuser::{
     FileAttr, Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
@@ -156,9 +158,13 @@ struct DirectoryAttr {
 }
 
 pub fn parse_error_cint(error: std::io::Error) -> c_int {
+    info!("error: {:?}", error);
+    info!("{}", std::backtrace::Backtrace::capture());
+    // panic!();
     match error.kind() {
         ErrorKind::NotFound => ENOENT,
         ErrorKind::InvalidFilename => ENAMETOOLONG, // is this right?
+        ErrorKind::DirectoryNotEmpty => ENOTEMPTY,
         _ => todo!(),
     }
 }
