@@ -1,7 +1,6 @@
 use nix::fcntl::renameat2;
 use nix::unistd::chown;
 use rustc_hash::FxHashMap;
-use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::fs::{File, FileTimes, OpenOptions};
@@ -31,6 +30,7 @@ use log::{debug, error, info, trace, warn};
 use crate::convert::{convert_file_type, convert_metadata, parse_flag_options};
 use crate::file_handler::FileHandler;
 use crate::fuse::{parse_error_cint, FileCreate, Fuse, IFileHandle, INode};
+use crate::index::{CanonicalProjectName, Index};
 
 const ROOT_DIR: INode = (1 as u64).into();
 const ATTR_TTL: Duration = Duration::new(1, 0);
@@ -42,7 +42,7 @@ pub struct NimbusFS {
     /// Not intended to be exposed to users
     local_storage: PathBuf,
 
-    /// Needed for symlink rewriting
+    /// Not really needed (useful for rewriting?)
     mount_directory: PathBuf,
 
     /// The last time nimbus was updated
@@ -56,12 +56,13 @@ pub struct NimbusFS {
     /// Map containing inode-pathbuf mappings
     ino_file_map: FxHashMap<INode, PathBuf>,
     file_ino_map: FxHashMap<PathBuf, INode>,
-    // Last inode allocated
-    // last_ino_alloc: u64,
+    index: Arc<Mutex<Index>>,
+
     /// Keep track of file handlers
     file_handlers_map: FxHashMap<IFileHandle, Arc<Mutex<FileHandler>>>,
     /// An incrementing counter so we can generate unique file handle ids
     last_file_handle: IFileHandle,
+    // Last inode allocated
     last_ino_alloc: INode,
 }
 
@@ -80,6 +81,7 @@ impl NimbusFS {
             generation: 0,
             ino_file_map: FxHashMap::default(),
             file_ino_map: FxHashMap::default(),
+            index: Arc::new(Mutex::new(Index::new())),
             file_handlers_map: FxHashMap::default(),
             last_file_handle: 0.into(),
             last_ino_alloc: ROOT_DIR,
@@ -90,6 +92,24 @@ impl NimbusFS {
         );
         nimbus
     }
+
+    pub fn index(&self) -> Arc<Mutex<Index>> {
+        Arc::clone(&self.index)
+    }
+
+    pub fn canonicize_project_name(&self, path: PathBuf) -> CanonicalProjectName {
+        path.strip_prefix(self.local_storage.clone())
+            .expect("Unable to canonicize project name (strip_prefix)")
+            .components()
+            .find_map(|c| match c {
+                std::path::Component::Normal(project) => Some(project),
+                _ => None,
+            })
+            .expect("Unable to canonicize project name (find_map)")
+            .into()
+    }
+
+    // pub fn get_path(&self, path)
 
     pub fn register_ino(&mut self, ino: INode, path: PathBuf) {
         self.ino_file_map.insert(ino, path.clone());

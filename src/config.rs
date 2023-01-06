@@ -10,21 +10,21 @@ pub enum MachineMode {
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Hash)]
 pub struct MachineConfig {
-    name: String,
-    mode: MachineMode,
-    port: usize,
+    pub name: String,
+    pub mode: MachineMode,
+    pub endpoint: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Hash)]
 pub struct NetworkMachineConfig {
-    command: String,
-    endpoint: String,
+    pub command: String,
+    pub endpoint: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Config {
-    machine: MachineConfig,
-    network: HashMap<String, NetworkMachineConfig>,
+    pub machine: MachineConfig,
+    pub network: HashMap<String, NetworkMachineConfig>,
 }
 
 pub fn read_config(config_path: PathBuf) -> Config {

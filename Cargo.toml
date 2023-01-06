@@ -17,6 +17,8 @@ ctrlc = "3.2.4"
 rustc-hash = "1.1.0"
 toml = "0.5.10"
 serde = { version = "1.0.152", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+warp = "0.3"
 
 [build-dependencies]
 pkg-config = "0.3.26"

@@ -15,3 +15,4 @@ pub mod files;
 pub mod fuse;
 pub mod index;
 pub mod macros;
+pub mod server;
