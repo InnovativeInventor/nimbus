@@ -11,13 +11,14 @@ pub struct FileHandler {
     write: Option<BufWriter<std::fs::File>>,
 }
 
+// todo: expose buf write size to user later
 impl FileHandler {
     pub fn new(file: std::fs::File, offset: i64, use_write_buffer: bool) -> FileHandler {
         if use_write_buffer {
             FileHandler {
                 file: None,
                 offset: offset,
-                write: Some(BufWriter::new(file)),
+                write: Some(BufWriter::with_capacity(4096 * 64, file)),
             }
         } else {
             FileHandler {
