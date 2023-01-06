@@ -27,12 +27,12 @@ use fuser::{
 use log::{debug, error, info, trace, warn};
 
 use crate::convert::{convert_file_type, convert_metadata, parse_flag_options};
-use crate::fuse::Fuse;
+use crate::fuse::{parse_error_cint, FileCreate, Fuse};
 
 const ROOT_DIR: u64 = 1;
 const ATTR_TTL: Duration = Duration::new(1, 0);
-const TIMEOUT: Duration = Duration::new(1, 0);
-const SLEEP_INTERVAL: Duration = Duration::new(0, 10);
+// const TIMEOUT: Duration = Duration::new(1, 0);
+// const SLEEP_INTERVAL: Duration = Duration::new(0, 10);
 
 pub struct FileHandler {
     offset: i64, // todo: should always be positive (maybe change type)
@@ -103,27 +103,27 @@ impl NimbusFS {
         self.file_ino_map.insert(path, ino);
     }
 
-    pub fn parent_name_lookup(&mut self, parent: u64, name: &OsStr) -> Option<PathBuf> {
-        if let Some(parent_file) = self.lookup_ino(&parent) {
-            // todo: might have to store all parents at some point
-            info!("Hit on parent!");
-            let mut file = parent_file.clone();
-            file.push(name);
-            info!("Child: {:?}", file);
-            Some(file)
-        } else {
-            None
-        }
-    }
+    // pub fn parent_name_lookup(&mut self, parent: u64, name: &OsStr) -> Option<PathBuf> {
+    //     if let Some(parent_file) = self.lookup_ino(&parent) {
+    //         // todo: might have to store all parents at some point
+    //         info!("Hit on parent!");
+    //         let mut file = parent_file.clone();
+    //         file.push(name);
+    //         info!("Child: {:?}", file);
+    //         Some(file)
+    //     } else {
+    //         None
+    //     }
+    // }
 
-    pub fn lookup_ino(&self, ino: &u64) -> Option<&PathBuf> {
-        self.ino_file_map.get(ino)
-    }
+    // pub fn lookup_ino(&self, ino: &u64) -> Option<&PathBuf> {
+    //     self.ino_file_map.get(ino)
+    // }
 
-    // todo: rename to lookup_path
-    pub fn lookup_file(&self, path: &PathBuf) -> Option<&u64> {
-        self.file_ino_map.get(path)
-    }
+    // // todo: rename to lookup_path
+    // pub fn lookup_file(&self, path: &PathBuf) -> Option<&u64> {
+    //     self.file_ino_map.get(path)
+    // }
 
     pub fn register_file_handle(&mut self, file: std::fs::File) -> u64 {
         self.last_file_handle += 1;
@@ -137,15 +137,26 @@ impl NimbusFS {
         self.last_file_handle
     }
 
-    pub fn lookup_file_handler(&mut self, fh: u64) -> Option<&Arc<Mutex<FileHandler>>> {
-        self.file_handlers_map.get(&fh)
-    }
+    // pub fn lookup_file_handler(&mut self, fh: u64) -> Option<&Arc<Mutex<FileHandler>>> {
+    //     self.file_handlers_map.get(&fh)
+    // }
 
-    pub fn delete_file_handler(&mut self, fh: u64) -> Option<Arc<Mutex<FileHandler>>> {
-        self.file_handlers_map.remove(&fh)
-    }
+    // pub fn delete_file_handler(&mut self, fh: u64) -> Option<Arc<Mutex<FileHandler>>> {
+    //     self.file_handlers_map.remove(&fh)
+    // }
 
     // Result variants
+    pub fn parent_name_lookup_result(
+        &mut self,
+        parent: u64,
+        name: &OsStr,
+    ) -> std::io::Result<PathBuf> {
+        let parent_file = self.lookup_ino_result(&parent)?;
+        let mut file = parent_file.clone();
+        file.push(name);
+        Ok(file)
+    }
+
     pub fn lookup_ino_result(&self, ino: &u64) -> std::io::Result<&PathBuf> {
         match self.ino_file_map.get(ino) {
             Some(path) => Ok(path),
@@ -211,110 +222,52 @@ impl Fuse for NimbusFS {
     fn getattr_fs(&mut self, req: &Request<'_>, ino: u64) -> std::io::Result<FileAttr> {
         let mut attr = self.getattr_path(self.lookup_ino_result(&ino)?)?;
         attr.ino = ino;
-        return Ok(attr);
-    }
-}
-
-impl Filesystem for NimbusFS {
-    fn init(&mut self, _req: &Request<'_>, _config: &mut KernelConfig) -> Result<(), c_int> {
-        info!("Filesystem mounted");
-        Ok(())
+        Ok(attr)
     }
 
-    fn getattr(&mut self, _j_req: &Request<'_>, ino: u64, reply: ReplyAttr) {
-        info!("Called: getattr(ino: {:#x?})", ino);
-        if let Some(file) = self.lookup_ino(&ino) {
-            info!("Hit!");
-            match self.getattr_path(&file) {
-                Ok(mut attr) => {
-                    attr.ino = ino;
-                    reply.attr(&ATTR_TTL, &attr);
-                }
-                Err(error) => match error.kind() {
-                    ErrorKind::NotFound => reply.error(ENOENT),
-                    _ => crate::unhandled!("Unimplemented error in getattr: {:?}", error),
-                },
-            }
-        } else {
-            info!("Miss!");
-            reply.error(ENOSYS);
-        }
-    }
-
-    fn readdir(
+    fn readdir_fs<'a>(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         ino: u64,
         fh: u64,
         offset: i64,
-        mut reply: ReplyDirectory,
-    ) {
-        info!(
-            "Called (root): readdir(ino: {:#x?}, fh: {}, offset: {})",
-            ino, fh, offset
-        );
-        if let Some(file) = self.lookup_ino(&ino) {
-            info!("Hit!");
-            if let Ok(entries) = fs::read_dir(file) {
-                for (counter, entry) in entries
-                    .skip(offset.try_into().expect("Overflow"))
-                    .enumerate()
-                {
-                    if let Ok(good_entry) = entry {
-                        if let Ok(good_file_type) = good_entry.file_type() {
-                            if let Ok(good_metadata) = good_entry.metadata() {
-                                let result = reply.add(
-                                    good_metadata.ino(),
-                                    counter as i64 + 1,
-                                    convert_file_type(good_file_type),
-                                    good_entry.file_name(),
-                                );
-                                self.register_ino(good_metadata.ino(), good_entry.path()); // opportunistically add
-                                if result {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
+        reply: &'a mut ReplyDirectory,
+    ) -> std::io::Result<&'a ReplyDirectory> {
+        let entries = fs::read_dir(self.lookup_ino_result(&ino)?)?;
+        for (counter, entry) in entries
+            .skip(offset.try_into().expect("Overflow")) // convert to result
+            .enumerate()
+        {
+            let good_entry = entry?;
+            let file_type = good_entry.file_type()?;
+            let metadata = good_entry.metadata()?;
+            self.register_ino(metadata.ino(), good_entry.path()); // opportunistically add
+            let result = reply.add(
+                metadata.ino(),
+                counter as i64 + 1,
+                convert_file_type(file_type),
+                good_entry.file_name(),
+            );
+            if result {
+                break;
             }
-            debug!("Replied with: {:?}", reply);
-            reply.ok();
-        } else {
-            info!("Miss!");
-            reply.error(ENOSYS);
         }
+        Ok(reply)
     }
 
-    fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        info!("lookup(parent: {:#x?}, name {:?})", parent, name);
-        if let Some(file) = self.parent_name_lookup(parent, name) {
-            match self.getattr_path(&file) {
-                Ok(attr) => {
-                    self.register_ino(attr.ino, file.clone()); // opportunistically add
-                    reply.entry(&ATTR_TTL, &attr, self.generation);
-                    info!("Attrs found for {:?}", file);
-                    info!("reply: {:?}", attr);
-                }
-                Err(err) => match err.kind() {
-                    ErrorKind::NotFound => {
-                        info!("ENOENT returned for {:?}", file);
-                        reply.error(ENOENT);
-                    }
-                    ErrorKind::InvalidFilename => {
-                        info!("ENAMETOOLONG returned for {:?}", file);
-                        reply.error(ENAMETOOLONG);
-                    }
-                    err => crate::unhandled!("Other error codes are unimplemented: {:?}", err),
-                },
-            }
-        } else {
-            info!("Miss!");
-            reply.error(ENOSYS);
-        }
+    fn lookup_fs(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+    ) -> std::io::Result<FileAttr> {
+        let filename = self.parent_name_lookup_result(parent, name)?;
+        let attr = self.getattr_path(&filename)?;
+        self.register_ino(attr.ino, filename); // opportunistically add
+        Ok(attr)
     }
 
-    fn read(
+    fn read_fs(
         &mut self,
         _req: &Request<'_>,
         ino: u64,
@@ -323,52 +276,27 @@ impl Filesystem for NimbusFS {
         size: u32,
         flags: i32,
         lock_owner: Option<u64>,
-        reply: ReplyData,
-    ) {
-        // todo: implement file handling logic
-        // todo: maybe implement flag handling logic
-        info!(
-            "read(ino: {:#x?}, fh: {}, offset: {}, size: {}, \
-            flags: {:#x?}, lock_owner: {:?})",
-            ino, fh, offset, size, flags, lock_owner
-        );
-        if let Some(f) = self.lookup_file_handler(fh) {
-            let mut data: Vec<u8> = vec![0; size.try_into().expect("Overflow")];
-            let arc_file_handler = Arc::clone(f);
-            let mut file_handler = arc_file_handler.lock().unwrap();
-            let file_handler_offset = file_handler.offset;
-            match file_handler.file.seek(SeekFrom::Current(
-                (offset - file_handler_offset).try_into().expect("Overflow"),
-            )) {
-                Ok(offset) => {
-                    file_handler.offset = offset as i64;
-                }
-                Err(_) => {
-                    reply.error(ENOSYS);
-                    error!(
-                        "Unimplemented read() error (seek with {})",
-                        file_handler_offset - offset
-                    );
-                    return;
-                }
-            }
-            match file_handler.file.read(&mut data) {
-                Ok(_) => {
-                    reply.data(&data.into_boxed_slice());
-                }
-                Err(_) => {
-                    reply.error(ENOSYS);
-                    error!("Unimplemented read() error (read)");
-                    return;
-                }
-            }
-        } else {
-            reply.error(ENOSYS);
-            error!("Unimplemented read() error (lookup_file_handler)");
-        }
-    }
+    ) -> std::io::Result<Vec<u8>> {
+        let f = self.lookup_file_handler_result(fh)?;
+        let arc_file_handler = Arc::clone(f);
+        let mut file_handler = arc_file_handler.lock().unwrap();
+        let file_handler_offset = file_handler.offset;
 
-    fn write(
+        // Seek to position
+        file_handler.offset = file_handler
+            .file
+            .seek(SeekFrom::Current(
+                (offset - file_handler_offset).try_into().expect("Overflow"),
+            ))?
+            .try_into()
+            .expect("Overflow");
+
+        // Read
+        let mut data: Vec<u8> = vec![0; size.try_into().expect("Overflow")];
+        file_handler.file.read(&mut data);
+        Ok(data)
+    }
+    fn write_fs(
         &mut self,
         _req: &Request<'_>,
         ino: u64,
@@ -378,127 +306,45 @@ impl Filesystem for NimbusFS {
         write_flags: u32,
         flags: i32,
         lock_owner: Option<u64>,
-        reply: ReplyWrite,
-    ) {
-        debug!(
-            "write(ino: {:#x?}, fh: {}, offset: {}, data.len(): {}, \
-            write_flags: {:#x?}, flags: {:#x?}, lock_owner: {:?})",
-            ino,
-            fh,
-            offset,
-            data.len(),
-            write_flags,
-            flags,
-            lock_owner
-        );
-        if let Some(f) = self.lookup_file_handler(fh) {
-            let arc_file_handler = Arc::clone(f);
-            let mut file_handler = arc_file_handler.lock().unwrap();
-            let file_handler_offset = file_handler.offset;
-            match file_handler.file.seek(SeekFrom::Current(
+    ) -> std::io::Result<usize> {
+        let f = self.lookup_file_handler_result(fh)?;
+        let arc_file_handler = Arc::clone(f);
+        let mut file_handler = arc_file_handler.lock().unwrap();
+        let file_handler_offset = file_handler.offset;
+
+        // Seek to position
+        file_handler.offset = file_handler
+            .file
+            .seek(SeekFrom::Current(
                 (offset - file_handler_offset).try_into().expect("Overflow"),
-            )) {
-                Ok(offset) => {
-                    file_handler.offset = offset as i64;
-                }
-                Err(_) => {
-                    reply.error(ENOSYS);
-                    error!(
-                        "Unimplemented write() error (seek with {})",
-                        file_handler_offset - offset
-                    );
-                    return;
-                }
-            }
-            match file_handler.file.write(&data) {
-                Ok(bytes_written) => {
-                    reply.written(bytes_written.try_into().expect("Buffer overflow"));
-                }
-                Err(_) => {
-                    reply.error(ENOSYS);
-                    error!("Unimplemented write() error (write)");
-                    return;
-                }
-            }
-        } else {
-            reply.error(ENOSYS);
-            error!("Unimplemented read() error (lookup_file_handler)");
-        }
-    }
+            ))?
+            .try_into()
+            .expect("Overflow");
 
-    fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
-        info!("Called open(ino: {:?}", ino);
-        if let Some(file) = self.lookup_ino(&ino) {
-            info!("Hit (open()): {:?}", file);
-            let options = parse_flag_options(flags);
-            match options.open(file) {
-                Ok(fh) => reply.opened(self.register_file_handle(fh), 0), // todo: check if 0 is the right flag to return here
-                Err(error) => match error.kind() {
-                    ErrorKind::NotFound => reply.error(ENOENT),
-                    _ => crate::unhandled!("Unimplemented open() error (open) with {:?}", error),
-                },
-            };
-        }
+        // Write
+        file_handler.file.write(data)
     }
-
-    fn create(
+    fn open_fs(&mut self, _req: &Request<'_>, ino: u64, flags: i32) -> std::io::Result<u64> // might also want to return flags in the future
+    {
+        let fh = parse_flag_options(flags).open(self.lookup_ino_result(&ino)?)?;
+        Ok(self.register_file_handle(fh))
+    }
+    fn create_fs(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         parent: u64,
         name: &OsStr,
         mode: u32,
         umask: u32,
         flags: i32,
-        reply: ReplyCreate,
-    ) {
-        info!(
-            "create(parent: {:#x?}, name: {:?}, mode: {}, umask: {:#x?}, \
-            flags: {:#x?})",
-            parent, name, mode, umask, flags
-        );
-
-        if let Some(file) = self.parent_name_lookup(parent, name) {
-            // let mut options = parse_flag_options(flags);
-            match File::create_new(file.clone()) {
-                Ok(fh) => {
-                    // let now = Instant::now();
-                    // while (!file.exists()) && now.elapsed() < TIMEOUT {
-                    //     thread::sleep(SLEEP_INTERVAL);
-                    // }
-                    match self.getattr_path(&file) {
-                        Ok(attr) => {
-                            info!("File created");
-                            self.register_ino(attr.ino, file); // opportunistically add
-                            reply.created(
-                                &ATTR_TTL,
-                                &attr,
-                                self.generation,
-                                self.register_file_handle(fh),
-                                0,
-                            );
-                        }
-                        Err(err) => match err.kind() {
-                            _ => crate::unhandled!(
-                                "create() error codes need to be implemented, {:?}",
-                                err
-                            ),
-                        },
-                    }
-                }
-                Err(err) => crate::unhandled!(
-                    "unhandled create() error {:?} with options {:?}",
-                    err,
-                    () // options
-                ),
-            }
-        } else {
-            reply.error(ENOSYS);
-            crate::unhandled!("Unimplemented create() error (lookup)");
-        }
+    ) -> std::io::Result<FileCreate> {
+        let filename = self.parent_name_lookup_result(parent, name)?;
+        let fh = File::create_new(filename.clone())?;
+        let attr = self.getattr_path(&filename)?;
+        self.register_ino(attr.ino, filename);
+        Ok(FileCreate::new(attr, self.register_file_handle(fh)))
     }
-
-    // chained
-    fn setattr(
+    fn setattr_fs(
         &mut self,
         req: &Request<'_>,
         ino: u64,
@@ -508,22 +354,16 @@ impl Filesystem for NimbusFS {
         size: Option<u64>,
         atime: Option<TimeOrNow>,
         mtime: Option<TimeOrNow>,
-        _ctime: Option<SystemTime>,
+        ctime: Option<SystemTime>,
         fh: Option<u64>,
-        _crtime: Option<SystemTime>,
-        _chgtime: Option<SystemTime>,
-        _bkuptime: Option<SystemTime>,
+        crtime: Option<SystemTime>,
+        chgtime: Option<SystemTime>,
+        bkuptime: Option<SystemTime>,
         flags: Option<u32>,
-        reply: ReplyAttr,
-    ) {
-        // todo: truncate option not handled yet
-        info!(
-            "Called setattr(ino: {:#x?}, mode: {:?}, uid: {:?}, \
-             gid: {:?}, size: {:?}, atime: {:?}, mtime: {:?}, fh: {:?}, flags: {:?})",
-            ino, mode, uid, gid, size, atime, mtime, fh, flags
-        );
+    ) -> std::io::Result<FileAttr> {
         let now = SystemTime::now();
         let mut times = FileTimes::new();
+
         if let Some(atime_p) = atime {
             times = match atime_p {
                 SpecificTime(t) => times.set_accessed(t),
@@ -538,108 +378,274 @@ impl Filesystem for NimbusFS {
         }
 
         // Currently, the file handler option is ignored
-        // if let Some(file_handler) = fh {
-        //     if let Some(f) = self.lookup_file_handler(file_handler) {
-        //         let arc_file_handler = Arc::clone(f);
-        //         let mut file_handler = arc_file_handler.lock().unwrap();
-        //         // let file_handler_offset = file_handler.offset;
-        //         file_handler
-        //             .file
-        //             .set_times(times)
-        //             .expect("setattr() failed to set times");
-        //     }
-        if let Some(filename) = self.lookup_ino(&ino) {
-            match File::options().write(true).open(filename) {
-                Ok(file) => {
-                    file.set_times(times)
-                        .expect("setattr() failed to set times");
-                    if let Some(mode_st) = mode {
-                        let mut perms = file
-                            .metadata()
-                            .expect("setattr() failed to fetch metadata")
-                            .permissions();
-                        perms.set_mode(mode_st);
-                    }
-                    if let Some(len) = size {
-                        file.set_len(len).expect("setattr() failed to set size");
-                    }
-                    // let the file get closed here
-                    match chown(filename, uid.map(|x| x.into()), gid.map(|x| x.into())) {
-                        Ok(_) => self.getattr(req, ino, reply),
-                        Err(error) => {
-                            reply.error(ENOSYS);
-                            crate::unhandled!(
-                                "Unimplemented error handling in setattr(): {:?}",
-                                error
-                            )
-                        }
-                    }
-                    // todo: set uid, gid, etc.
-                }
-                Err(error) => match error.kind() {
-                    ErrorKind::IsADirectory => {
-                        info!("Returned EISDIR for {:?}", filename);
-                        reply.error(EISDIR)
-                    }
-                    error => {
-                        reply.error(ENOSYS);
-                        crate::unhandled!("Unimplemented error handling in setattr(): {:?}", error)
-                    }
-                },
-            }
-        } else {
-            crate::unhandled!("Unimplemented error handling in setattr()")
+        let filename = self.lookup_ino_result(&ino)?;
+        let file = File::options().write(true).open(filename)?;
+
+        file.set_times(times)?;
+        if let Some(mode_st) = mode {
+            let mut perms = file.metadata()?.permissions();
+            perms.set_mode(mode_st);
+        }
+        if let Some(len) = size {
+            file.set_len(len)?;
+        }
+        if uid.is_some() || gid.is_some() {
+            chown(filename, uid.map(|x| x.into()), gid.map(|x| x.into()))?;
+        }
+
+        self.getattr_fs(req, ino)
+    }
+
+    fn flush_fs(
+        &mut self,
+        req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        lock_owner: u64,
+    ) -> std::io::Result<()> {
+        let f = self.lookup_file_handler_result(fh)?;
+        let arc_file_handler = Arc::clone(f);
+        let mut file_handler = arc_file_handler.lock().unwrap();
+        file_handler.file.flush()?;
+        file_handler.file.sync_all()
+    }
+
+    fn release_fs(
+        &mut self,
+        req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        flags: i32,
+        lock_owner: Option<u64>,
+        flush: bool,
+    ) -> std::io::Result<()> {
+        let f = self.delete_file_handler_result(fh)?;
+        let mut file_handler = f.lock().unwrap();
+        file_handler.file.flush()?; // maybe check bool flag?
+        file_handler.file.sync_all()
+    }
+    fn mkdir_fs(
+        &mut self,
+        req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+    ) -> std::io::Result<FileAttr> {
+        let dir_path = self.parent_name_lookup_result(parent, name)?;
+        fs::create_dir(dir_path.clone())?;
+        fs::symlink_metadata(dir_path)?.permissions().set_mode(mode);
+        self.lookup_fs(req, parent, name)
+    }
+
+    fn rmdir_fs(&mut self, req: &Request<'_>, parent: u64, name: &OsStr) -> std::io::Result<()> {
+        let dir_path = self.parent_name_lookup_result(parent, name)?;
+        fs::remove_dir(dir_path)
+    }
+    fn rename_fs(
+        &mut self,
+        req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        new_parent: u64,
+        new_name: &OsStr,
+        flags: u32,
+    ) -> std::io::Result<()> {
+        let dir_path = self.parent_name_lookup_result(parent, name)?;
+        let new_dir_path = self.parent_name_lookup_result(new_parent, new_name)?;
+        fs::rename(dir_path, new_dir_path)
+    }
+    fn symlink_fs(
+        &mut self,
+        req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        link: &Path,
+    ) -> std::io::Result<FileAttr> {
+        let sym_path = self.parent_name_lookup_result(parent, name)?;
+        std::os::unix::fs::symlink(link, sym_path)?;
+        self.lookup_fs(req, parent, name)
+    }
+    fn unlink_fs(&mut self, req: &Request<'_>, parent: u64, name: &OsStr) -> std::io::Result<()> {
+        let file_path = self.parent_name_lookup_result(parent, name)?;
+        fs::remove_file(file_path)
+    }
+    fn readlink_fs(&mut self, req: &Request<'_>, ino: u64) -> std::io::Result<std::path::PathBuf> {
+        let file = self.lookup_ino_result(&ino)?;
+        fs::read_link(file)
+    }
+    //     fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
+    //         debug!("Calling readlink(ino: {:#x?})", ino);
+    //         if let Some(file) = self.lookup_ino(&ino) {
+    //             info!("Reading symlink at: {:?}", file);
+    //             match fs::read_link(file) {
+    //                 Ok(loc) => {
+    //                     reply.data(
+    //                         loc.to_str()
+    //                             .expect("Unable to convert PathBuf to str")
+    //                             .as_bytes(),
+    //                     );
+    //                 }
+    //                 Err(_) => crate::unhandled!(),
+    //             }
+    //         } else {
+    //             reply.error(ENOSYS);
+    //         }
+    //     }
+}
+
+// This mostly does error handling
+impl Filesystem for NimbusFS {
+    fn init(
+        &mut self,
+        req: &Request<'_>,
+        config: &mut KernelConfig,
+    ) -> std::result::Result<(), c_int> {
+        match self.init_fs(req, config) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(parse_error_cint(error)),
         }
     }
 
-    fn flush(&mut self, _req: &Request<'_>, ino: u64, fh: u64, lock_owner: u64, reply: ReplyEmpty) {
-        info!(
-            "flush(ino: {:#x?}, fh: {}, lock_owner: {:?})",
-            ino, fh, lock_owner
-        );
-        if let Some(f) = self.lookup_file_handler(fh) {
-            let arc_file_handler = Arc::clone(f);
-            let mut file_handler = arc_file_handler.lock().unwrap();
-            if file_handler.file.flush().is_ok() && file_handler.file.sync_all().is_ok() {
-                reply.ok();
+    fn getattr(&mut self, req: &Request<'_>, ino: u64, reply: ReplyAttr) {
+        match self.getattr_fs(req, ino) {
+            Ok(attr) => reply.attr(&self.duration(), &attr),
+            Err(error) => reply.error(parse_error_cint(error)),
+        };
+    }
+
+    fn readdir(
+        &mut self,
+        req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        mut reply: ReplyDirectory,
+    ) {
+        match self.readdir_fs(req, ino, fh, offset, &mut reply) {
+            Ok(_) => reply.ok(),
+            Err(error) => reply.error(parse_error_cint(error)),
+        }
+    }
+
+    fn lookup(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        match self.lookup_fs(req, parent, name) {
+            Ok(attr) => {
+                reply.entry(&ATTR_TTL, &attr, self.generation);
+                info!("reply: {:?}", attr);
             }
-        } else {
-            reply.error(ENOSYS);
+            Err(error) => reply.error(parse_error_cint(error)),
+        }
+    }
+
+    fn read(
+        &mut self,
+        req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        size: u32,
+        flags: i32,
+        lock_owner: Option<u64>,
+        reply: ReplyData,
+    ) {
+        match self.read_fs(req, ino, fh, offset, size, flags, lock_owner) {
+            Ok(data) => reply.data(&data.into_boxed_slice()),
+            Err(error) => reply.error(parse_error_cint(error)),
+        }
+    }
+
+    fn write(
+        &mut self,
+        req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        data: &[u8],
+        write_flags: u32,
+        flags: i32,
+        lock_owner: Option<u64>,
+        reply: ReplyWrite,
+    ) {
+        match self.write_fs(req, ino, fh, offset, data, write_flags, flags, lock_owner) {
+            Ok(write_size) => reply.written(write_size.try_into().expect("Overflow")),
+            Err(error) => reply.error(parse_error_cint(error)),
+        }
+    }
+
+    fn open(&mut self, req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+        match self.open_fs(req, ino, flags) {
+            Ok(fh) => reply.opened(fh, 0), // todo: check if 0 is the right flag to return here
+            Err(error) => reply.error(parse_error_cint(error)),
+        };
+    }
+
+    fn create(
+        &mut self,
+        req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        flags: i32,
+        reply: ReplyCreate,
+    ) {
+        match self.create_fs(req, parent, name, mode, umask, flags) {
+            Ok(file) => reply.created(&ATTR_TTL, &file.attr, self.generation, file.fh, 0), // flags?
+            Err(error) => reply.error(parse_error_cint(error)),
+        }
+    }
+
+    fn setattr(
+        &mut self,
+        req: &Request<'_>,
+        ino: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        ctime: Option<SystemTime>,
+        fh: Option<u64>,
+        crtime: Option<SystemTime>,
+        chgtime: Option<SystemTime>,
+        bkuptime: Option<SystemTime>,
+        flags: Option<u32>,
+        reply: ReplyAttr,
+    ) {
+        match self.setattr_fs(
+            req, ino, mode, uid, gid, size, atime, mtime, ctime, fh, crtime, chgtime, bkuptime,
+            flags,
+        ) {
+            Ok(attr) => reply.attr(&self.duration(), &attr),
+            Err(error) => reply.error(parse_error_cint(error)),
+        }
+    }
+
+    fn flush(&mut self, req: &Request<'_>, ino: u64, fh: u64, lock_owner: u64, reply: ReplyEmpty) {
+        match self.flush_fs(req, ino, fh, lock_owner) {
+            Ok(_) => reply.ok(),
+            Err(error) => reply.error(parse_error_cint(error)),
         }
     }
 
     fn release(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         ino: u64,
         fh: u64,
-        _flags: i32,
-        _lock_owner: Option<u64>,
-        _flush: bool,
+        flags: i32,
+        lock_owner: Option<u64>,
+        flush: bool,
         reply: ReplyEmpty,
     ) {
-        info!("release(fh: {:?}) called", fh);
-        match self.delete_file_handler(fh) {
-            Some(fh) => {
-                let mut f = fh.lock().expect("Unable to obtain mutex in release()");
-                if f.file.flush().is_ok() && f.file.sync_all().is_ok() {
-                    reply.ok();
-                } else {
-                    crate::unhandled!("Unimplemented error handling in release()");
-                }
-            }
-            None => {
-                crate::unhandled!("Unimplemented error handling in release()");
-            }
+        match self.release_fs(req, ino, fh, flags, lock_owner, flush) {
+            Ok(_) => reply.ok(),
+            Err(error) => reply.error(parse_error_cint(error)),
         }
-
-        info!(
-            "There are {} file handers remaining",
-            self.count_file_handlers()
-        );
     }
 
-    // chained
     fn mkdir(
         &mut self,
         req: &Request<'_>,
@@ -649,46 +655,22 @@ impl Filesystem for NimbusFS {
         umask: u32,
         reply: ReplyEntry,
     ) {
-        info!(
-            "mkdir(parent: {:#x?}, name: {:?}, mode: {}, umask: {:#x?})",
-            parent, name, mode, umask
-        );
-        if let Some(dir_path) = self.parent_name_lookup(parent, name) {
-            match fs::create_dir(dir_path.clone()) {
-                Ok(_) => {
-                    let mut perms = fs::symlink_metadata(dir_path)
-                        .expect("mkdir() failed to fetch metadata")
-                        .permissions();
-                    perms.set_mode(mode);
-                    self.lookup(req, parent, name, reply);
-                }
-                Err(_) => {
-                    crate::unhandled!("Unimplemeneted error handling in mkdir()");
-                }
-            }
-        } else {
-            crate::unhandled!("Unimplemeneted error handling in mkdir()");
+        match self.mkdir_fs(req, parent, name, mode, umask) {
+            Ok(attr) => reply.entry(&ATTR_TTL, &attr, 0),
+            Err(error) => reply.error(parse_error_cint(error)),
         }
     }
 
-    fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        // todo: need to postpone removal and implement inode counter
-        info!("rmdir(parent: {:#x?}, name: {:?})", parent, name,);
-        if let Some(dir_path) = self.parent_name_lookup(parent, name) {
-            match fs::remove_dir(dir_path) {
-                Ok(_) => reply.ok(),
-                Err(_) => {
-                    crate::unhandled!("Unimplemeneted error handling in mkdir()");
-                }
-            }
-        } else {
-            crate::unhandled!("Unimplemeneted error handling in rmdir()");
+    fn rmdir(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        match self.rmdir_fs(req, parent, name) {
+            Ok(attr) => reply.ok(),
+            Err(error) => reply.error(parse_error_cint(error)),
         }
     }
 
     fn rename(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         parent: u64,
         name: &OsStr,
         new_parent: u64,
@@ -696,28 +678,11 @@ impl Filesystem for NimbusFS {
         flags: u32,
         reply: ReplyEmpty,
     ) {
-        info!(
-            "rename(parent: {:#x?}, name: {:?}, newparent: {:#x?}, \
-            newname: {:?}, flags: {})",
-            parent, name, new_parent, new_name, flags,
-        );
-        if let Some(dir_path) = self.parent_name_lookup(parent, name) {
-            if let Some(new_dir_path) = self.parent_name_lookup(new_parent, new_name) {
-                match fs::rename(dir_path, new_dir_path) {
-                    Ok(_) => reply.ok(),
-                    Err(_) => {
-                        crate::unhandled!("Unimplemeneted error handling in mkdir()");
-                    }
-                }
-            } else {
-                crate::unhandled!("Unimplemeneted error handling in mkdir()");
-            }
-        } else {
-            crate::unhandled!("Unimplemeneted error handling in rmdir()");
+        match self.rename_fs(req, parent, name, new_parent, new_name, flags) {
+            Ok(_) => reply.ok(),
+            Err(error) => reply.error(parse_error_cint(error)),
         }
     }
-
-    // chained
     fn symlink(
         &mut self,
         req: &Request<'_>,
@@ -726,62 +691,41 @@ impl Filesystem for NimbusFS {
         link: &Path,
         reply: ReplyEntry,
     ) {
-        info!(
-            "symlink(parent: {:#x?}, name: {:?}, link: {:?})",
-            parent, name, link,
-        );
-        if let Some(sym_path) = self.parent_name_lookup(parent, name) {
-            match std::os::unix::fs::symlink(link, sym_path) {
-                Ok(_) => {
-                    self.lookup(req, parent, name, reply);
-                }
-                Err(_) => crate::unhandled!("Unimplemented error handling in symlink()"),
-            }
-        } else {
-            crate::unhandled!("Unimplemented error handling in symlink()");
+        match self.symlink_fs(req, parent, name, link) {
+            Ok(attr) => reply.entry(&ATTR_TTL, &attr, 0),
+            Err(error) => reply.error(parse_error_cint(error)),
         }
     }
-
-    fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        if let Some(file_path) = self.parent_name_lookup(parent, name) {
-            match fs::remove_file(file_path) {
-                Ok(_) => reply.ok(),
-                Err(_) => crate::unhandled!("Unimplemented error handling in symlink()"),
-            }
-        } else {
-            crate::unhandled!("Unimplemented error handling in symlink()");
+    fn unlink(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        match self.unlink_fs(req, parent, name) {
+            Ok(_) => reply.ok(),
+            Err(error) => reply.error(parse_error_cint(error)),
         }
     }
-
-    fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
-        debug!("Calling readlink(ino: {:#x?})", ino);
-        if let Some(file) = self.lookup_ino(&ino) {
-            info!("Reading symlink at: {:?}", file);
-            match fs::read_link(file) {
-                Ok(loc) => {
-                    reply.data(
-                        loc.to_str()
-                            .expect("Unable to convert PathBuf to str")
-                            .as_bytes(),
-                    );
-                }
-                Err(_) => crate::unhandled!(),
-            }
-        } else {
-            reply.error(ENOSYS);
+    fn readlink(&mut self, req: &Request<'_>, ino: u64, reply: ReplyData) {
+        match self.readlink_fs(req, ino) {
+            Ok(loc) => reply.data(
+                loc.to_str()
+                    .expect("Unable to convert PathBuf to str")
+                    .as_bytes(),
+            ),
+            Err(error) => reply.error(parse_error_cint(error)),
         }
     }
-
-    // fn destroy(&mut self) {
-    //     info!("Leaving filesystem and unmounting!");
-    // }
-
-    // fn opendir(&mut self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: ReplyOpen) {
-    //     crate::unhandled!("Unimplemented opendir() call");
-    //     reply.opened(0, 0);
-    // }
-    // fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
-    //     crate::unhandled!("Unimplemented fstatfs() call");
-    //     reply.statfs(0, 0, 0, 0, 0, 512, 255, 0);
-    // }
 }
+
+// impl Filesystem for NimbusFS {
+
+//     // fn destroy(&mut self) {
+//     //     info!("Leaving filesystem and unmounting!");
+//     // }
+
+//     // fn opendir(&mut self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: ReplyOpen) {
+//     //     crate::unhandled!("Unimplemented opendir() call");
+//     //     reply.opened(0, 0);
+//     // }
+//     // fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
+//     //     crate::unhandled!("Unimplemented fstatfs() call");
+//     //     reply.statfs(0, 0, 0, 0, 0, 512, 255, 0);
+//     // }
+// }
