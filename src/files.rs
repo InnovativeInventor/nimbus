@@ -100,11 +100,11 @@ impl NimbusFS {
         self.last_ino_alloc
     }
 
-    pub fn register_file_handle(&mut self, file: std::fs::File) -> u64 {
+    pub fn register_file_handle(&mut self, file: std::fs::File, use_write_buffer: bool) -> u64 {
         self.last_file_handle += 1;
         self.file_handlers_map.insert(
             self.last_file_handle,
-            Arc::new(Mutex::new(FileHandler::new(file, 0))),
+            Arc::new(Mutex::new(FileHandler::new(file, 0, use_write_buffer))),
         );
         self.last_file_handle
     }
@@ -332,8 +332,9 @@ impl Fuse for NimbusFS {
     }
     fn open_fs(&mut self, _req: &Request<'_>, ino: u64, flags: i32) -> std::io::Result<u64> // might also want to return flags in the future
     {
-        let fh = parse_flag_options(flags).open(self.lookup_ino_result(&ino)?)?;
-        Ok(self.register_file_handle(fh))
+        let (options, use_write_buffer) = parse_flag_options(flags);
+        let fh = options.open(self.lookup_ino_result(&ino)?)?;
+        Ok(self.register_file_handle(fh, use_write_buffer))
     }
     fn create_fs(
         &mut self,
@@ -348,8 +349,12 @@ impl Fuse for NimbusFS {
         let fh = File::create_new(filename.clone())?;
         let mut attr = self.getattr_path(&filename)?;
         let ino = self.lookup_or_create_path(&filename);
+        let (_, use_write_buffer) = parse_flag_options(flags);
         attr.ino = ino;
-        Ok(FileCreate::new(attr, self.register_file_handle(fh)))
+        Ok(FileCreate::new(
+            attr,
+            self.register_file_handle(fh, use_write_buffer),
+        ))
     }
     fn setattr_fs(
         &mut self,

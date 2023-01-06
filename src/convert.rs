@@ -50,13 +50,25 @@ pub fn convert_metadata(metadata: &fs::Metadata) -> FileAttr {
     }
 }
 
-pub fn parse_flag_options<'a>(flags: i32) -> OpenOptions {
+pub fn parse_flag_options<'a>(flags: i32) -> (OpenOptions, bool) {
     let mut open_options = OpenOptions::new();
-    match flags & O_ACCMODE {
-        O_RDONLY => open_options.read(true),
-        O_WRONLY => open_options.write(true),
-        O_RDWR => open_options.read(true).write(true),
-        O_APPEND => open_options.append(true),
+    let use_write_buffer = match flags & O_ACCMODE {
+        O_RDONLY => {
+            open_options.read(true);
+            false
+        }
+        O_WRONLY => {
+            open_options.write(true);
+            true
+        }
+        O_RDWR => {
+            open_options.read(true).write(true);
+            false
+        }
+        O_APPEND => {
+            open_options.append(true);
+            false
+        }
         other => unimplemented!("Unimplemented flag ({})!", other & O_ACCMODE),
         // O_EXEC => {
         //     unimplemented!("Open with O_EXEC flag is unimplemented!")
@@ -65,5 +77,5 @@ pub fn parse_flag_options<'a>(flags: i32) -> OpenOptions {
         //     unimplemented!("Open with O_SEARCH flag is unimplemented!")
         // }
     };
-    open_options
+    (open_options, use_write_buffer)
 }
