@@ -3,6 +3,7 @@
     nativeBuildInputs = with pkgs; [
       cargo
       gcc_latest
+      gdb
 
       sccache
       mold
