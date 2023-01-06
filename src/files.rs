@@ -1,5 +1,6 @@
 use nix::fcntl::renameat2;
 use nix::unistd::chown;
+use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
@@ -53,12 +54,12 @@ pub struct NimbusFS {
     pub generation: u64,
 
     /// Map containing inode-pathbuf mappings
-    ino_file_map: HashMap<u64, PathBuf>,
-    file_ino_map: HashMap<PathBuf, u64>,
+    ino_file_map: FxHashMap<u64, PathBuf>,
+    file_ino_map: FxHashMap<PathBuf, u64>,
     // Last inode allocated
     // last_ino_alloc: u64,
     /// Keep track of file handlers
-    file_handlers_map: HashMap<u64, Arc<Mutex<FileHandler>>>,
+    file_handlers_map: FxHashMap<u64, Arc<Mutex<FileHandler>>>,
     /// An incrementing counter so we can generate unique file handle ids
     last_file_handle: u64,
     last_ino_alloc: u64,
@@ -77,9 +78,9 @@ impl NimbusFS {
             last_updated_local: SystemTime::from(last_updated),
             // attr_ttl: Duration::new(1, 0), // default to one sec
             generation: 0,
-            ino_file_map: HashMap::new(),
-            file_ino_map: HashMap::new(),
-            file_handlers_map: HashMap::new(),
+            ino_file_map: FxHashMap::default(),
+            file_ino_map: FxHashMap::default(),
+            file_handlers_map: FxHashMap::default(),
             last_file_handle: 0,
             last_ino_alloc: ROOT_DIR,
         };

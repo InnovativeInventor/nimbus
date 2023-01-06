@@ -11,7 +11,7 @@ pub struct FileHandler {
     write: Option<BufWriter<std::fs::File>>,
 }
 
-// todo: expose buf write size to user later
+// todo: expose buf write size to user later, tune buffer size better
 impl FileHandler {
     pub fn new(file: std::fs::File, offset: i64, use_write_buffer: bool) -> FileHandler {
         if use_write_buffer {
