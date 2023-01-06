@@ -28,17 +28,13 @@ use fuser::{
 use log::{debug, error, info, trace, warn};
 
 use crate::convert::{convert_file_type, convert_metadata, parse_flag_options};
+use crate::file_handler::FileHandler;
 use crate::fuse::{parse_error_cint, FileCreate, Fuse};
 
 const ROOT_DIR: u64 = 1;
 const ATTR_TTL: Duration = Duration::new(1, 0);
 // const TIMEOUT: Duration = Duration::new(1, 0);
 // const SLEEP_INTERVAL: Duration = Duration::new(0, 10);
-
-pub struct FileHandler {
-    offset: i64, // todo: should always be positive (maybe change type)
-    file: std::fs::File,
-}
 
 pub struct NimbusFS {
     /// This where we store the nimbus files on disk
@@ -108,10 +104,7 @@ impl NimbusFS {
         self.last_file_handle += 1;
         self.file_handlers_map.insert(
             self.last_file_handle,
-            Arc::new(Mutex::new(FileHandler {
-                offset: 0,
-                file: file,
-            })),
+            Arc::new(Mutex::new(FileHandler::new(file, 0))),
         );
         self.last_file_handle
     }
@@ -295,14 +288,13 @@ impl Fuse for NimbusFS {
         //     .try_into()
         //     .expect("Overflow");
         file_handler.offset = file_handler
-            .file
             .seek(SeekFrom::Start(offset.try_into().expect("Overflow")))?
             .try_into()
             .expect("Overflow");
 
         // Read
         let mut data: Vec<u8> = vec![0; size.try_into().expect("Overflow")];
-        file_handler.file.read(&mut data)?;
+        file_handler.read(&mut data)?;
         Ok(data)
     }
     fn write_fs(
@@ -329,14 +321,14 @@ impl Fuse for NimbusFS {
         //     ))?
         //     .try_into()
         //     .expect("Overflow");
-        file_handler.offset = file_handler // corrupt
-            .file
-            .seek(SeekFrom::Start(offset.try_into().expect("Overflow")))?
-            .try_into()
-            .expect("Overflow");
+        file_handler.offset =
+            file_handler // corrupt
+                .seek(SeekFrom::Start(offset.try_into().expect("Overflow")))?
+                .try_into()
+                .expect("Overflow");
 
         // Write
-        file_handler.file.write(data)
+        file_handler.write(data)
     }
     fn open_fs(&mut self, _req: &Request<'_>, ino: u64, flags: i32) -> std::io::Result<u64> // might also want to return flags in the future
     {
@@ -421,8 +413,8 @@ impl Fuse for NimbusFS {
         let f = self.lookup_file_handler_result(fh)?;
         let arc_file_handler = Arc::clone(f);
         let mut file_handler = arc_file_handler.lock().unwrap();
-        file_handler.file.flush()?;
-        file_handler.file.sync_all()
+        file_handler.flush()?;
+        file_handler.sync_all()
     }
 
     fn release_fs(
@@ -436,8 +428,8 @@ impl Fuse for NimbusFS {
     ) -> std::io::Result<()> {
         let f = self.delete_file_handler_result(fh)?;
         let mut file_handler = f.lock().unwrap();
-        file_handler.file.flush()?; // maybe check bool flag?
-        file_handler.file.sync_all()
+        file_handler.flush()?; // maybe check bool flag?
+        file_handler.sync_all()
     }
     fn mkdir_fs(
         &mut self,
