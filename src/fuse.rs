@@ -10,6 +10,8 @@ use std::io::{ErrorKind, Result}; // O_EXEC, O_SEARCH,
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
+use serde::{Deserialize, Serialize};
+
 use crate::macros;
 
 use fuser::{
@@ -17,7 +19,7 @@ use fuser::{
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct INode {
     inode: u64,
 }

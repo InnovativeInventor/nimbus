@@ -5,6 +5,7 @@ use structopt::StructOpt;
 
 use fuser::{MountOption, Session};
 
+use nimbus::config::read_config;
 use nimbus::files::NimbusFS;
 
 #[derive(StructOpt, Debug)]
@@ -15,6 +16,9 @@ struct Opt {
 
     #[structopt(short, long)]
     local_storage: PathBuf,
+
+    #[structopt(short, long)]
+    config: PathBuf,
 }
 
 fn main() {
@@ -22,6 +26,11 @@ fn main() {
     let args = Opt::from_args();
 
     info!("Args parsed");
+
+    let config = read_config(args.config);
+
+    info!("{:?}", config);
+
     let nimbus = NimbusFS::default(args.local_storage, args.mount_directory.clone());
 
     let session = Session::new(

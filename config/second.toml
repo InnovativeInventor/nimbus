@@ -1,0 +1,9 @@
+[machine]
+name = "second"
+mode = "DevelopmentMode"
+port = 5001
+
+[network.second]
+name = "main"
+command = "cp -r {HERE} {THERE}"
+endpoint = "http://127.0.0.1:5000"
