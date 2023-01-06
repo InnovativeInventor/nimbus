@@ -1,3 +1,4 @@
+use nix::fcntl::renameat2;
 use nix::unistd::chown;
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -468,10 +469,18 @@ impl Fuse for NimbusFS {
         new_name: &OsStr,
         flags: u32,
     ) -> std::io::Result<()> {
+        // todo: check flags for RENAME_EXCHANGE and RENAME_NOREPLACE
         let dir_path = self.parent_name_lookup_result(parent, name)?;
         // let ino = *self.lookup_file_result(&dir_path)?;
         let new_dir_path = self.parent_name_lookup_result(new_parent, new_name)?;
-        fs::rename(dir_path.clone(), new_dir_path)?;
+        renameat2(
+            None,
+            &dir_path,
+            None,
+            &new_dir_path,
+            nix::fcntl::RenameFlags::from_bits_truncate(flags),
+        )?;
+        // fs::rename(dir_path.clone(), new_dir_path)?;
         // self.remove_path(&dir_path)?;
         let new_ino = self.fresh_ino();
         self.register_ino(new_ino, dir_path);
