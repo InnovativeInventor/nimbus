@@ -156,6 +156,13 @@ impl NimbusFS {
         }
     }
 
+    pub fn rename_ino(&mut self, old_path: &PathBuf, new_path: &PathBuf) -> std::io::Result<()> {
+        let ino = *self.lookup_file_result(&old_path.clone())?;
+        self.remove_path(&old_path.clone())?;
+        self.register_ino(ino, new_path.clone());
+        Ok(())
+    }
+
     pub fn remove_path(&mut self, path: &PathBuf) -> std::io::Result<()> {
         match self.file_ino_map.remove(path) {
             Some(ino) => match self.ino_file_map.remove(&ino) {
@@ -481,9 +488,10 @@ impl Fuse for NimbusFS {
             nix::fcntl::RenameFlags::from_bits_truncate(flags),
         )?;
         // fs::rename(dir_path.clone(), new_dir_path)?;
+        self.rename_ino(&dir_path, &new_dir_path)?;
         // self.remove_path(&dir_path)?;
-        let new_ino = self.fresh_ino();
-        self.register_ino(new_ino, dir_path);
+        // let new_ino = self.fresh_ino();
+        // self.register_ino(new_ino, dir_path);
         Ok(())
     }
     fn symlink_fs(
@@ -498,6 +506,7 @@ impl Fuse for NimbusFS {
         self.lookup_fs(req, parent, name)
     }
     fn unlink_fs(&mut self, req: &Request<'_>, parent: u64, name: &OsStr) -> std::io::Result<()> {
+        info!("unlink called");
         let file_path = self.parent_name_lookup_result(parent, name)?;
         fs::remove_file(file_path.clone())?;
         // self.remove_path(&file_path)?;
@@ -659,6 +668,10 @@ impl Filesystem for NimbusFS {
             Ok(_) => reply.ok(),
             Err(error) => reply.error(parse_error_cint(error)),
         }
+    }
+
+    fn opendir(&mut self, req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+        reply.error(ENOSYS);
     }
 
     fn mkdir(

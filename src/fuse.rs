@@ -158,8 +158,8 @@ struct DirectoryAttr {
 }
 
 pub fn parse_error_cint(error: std::io::Error) -> c_int {
-    info!("error: {:?}", error);
-    info!("{}", std::backtrace::Backtrace::capture());
+    info!("parse error: {:?}", error);
+    // info!("{}", std::backtrace::Backtrace::capture());
     // panic!();
     match error.kind() {
         ErrorKind::NotFound => ENOENT,
