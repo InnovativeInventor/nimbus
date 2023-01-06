@@ -30,9 +30,9 @@ use log::{debug, error, info, trace, warn};
 
 use crate::convert::{convert_file_type, convert_metadata, parse_flag_options};
 use crate::file_handler::FileHandler;
-use crate::fuse::{parse_error_cint, FileCreate, Fuse};
+use crate::fuse::{parse_error_cint, FileCreate, Fuse, IFileHandle, INode};
 
-const ROOT_DIR: u64 = 1;
+const ROOT_DIR: INode = (1 as u64).into();
 const ATTR_TTL: Duration = Duration::new(1, 0);
 // const TIMEOUT: Duration = Duration::new(1, 0);
 // const SLEEP_INTERVAL: Duration = Duration::new(0, 10);
@@ -40,29 +40,29 @@ const ATTR_TTL: Duration = Duration::new(1, 0);
 pub struct NimbusFS {
     /// This where we store the nimbus files on disk
     /// Not intended to be exposed to users
-    pub local_storage: PathBuf,
+    local_storage: PathBuf,
 
     /// Needed for symlink rewriting
-    pub mount_directory: PathBuf,
+    mount_directory: PathBuf,
 
     /// The last time nimbus was updated
-    pub last_updated_utc: DateTime<Utc>,
-    pub last_updated_local: SystemTime,
+    last_updated_utc: DateTime<Utc>,
+    last_updated_local: SystemTime,
 
     /// Attribute cache duration
     // pub attr_ttl: Duration,
-    pub generation: u64,
+    generation: u64,
 
     /// Map containing inode-pathbuf mappings
-    ino_file_map: FxHashMap<u64, PathBuf>,
-    file_ino_map: FxHashMap<PathBuf, u64>,
+    ino_file_map: FxHashMap<INode, PathBuf>,
+    file_ino_map: FxHashMap<PathBuf, INode>,
     // Last inode allocated
     // last_ino_alloc: u64,
     /// Keep track of file handlers
-    file_handlers_map: FxHashMap<u64, Arc<Mutex<FileHandler>>>,
+    file_handlers_map: FxHashMap<IFileHandle, Arc<Mutex<FileHandler>>>,
     /// An incrementing counter so we can generate unique file handle ids
-    last_file_handle: u64,
-    last_ino_alloc: u64,
+    last_file_handle: IFileHandle,
+    last_ino_alloc: INode,
 }
 
 impl NimbusFS {
@@ -81,7 +81,7 @@ impl NimbusFS {
             ino_file_map: FxHashMap::default(),
             file_ino_map: FxHashMap::default(),
             file_handlers_map: FxHashMap::default(),
-            last_file_handle: 0,
+            last_file_handle: 0.into(),
             last_ino_alloc: ROOT_DIR,
         };
         nimbus.register_ino(
@@ -91,18 +91,22 @@ impl NimbusFS {
         nimbus
     }
 
-    pub fn register_ino(&mut self, ino: u64, path: PathBuf) {
+    pub fn register_ino(&mut self, ino: INode, path: PathBuf) {
         self.ino_file_map.insert(ino, path.clone());
         self.file_ino_map.insert(path, ino);
     }
 
-    pub fn fresh_ino(&mut self) -> u64 {
-        self.last_ino_alloc += 1;
+    pub fn fresh_ino(&mut self) -> INode {
+        self.last_ino_alloc.inc();
         self.last_ino_alloc
     }
 
-    pub fn register_file_handle(&mut self, file: std::fs::File, use_write_buffer: bool) -> u64 {
-        self.last_file_handle += 1;
+    pub fn register_file_handle(
+        &mut self,
+        file: std::fs::File,
+        use_write_buffer: bool,
+    ) -> IFileHandle {
+        self.last_file_handle.inc();
         self.file_handlers_map.insert(
             self.last_file_handle,
             Arc::new(Mutex::new(FileHandler::new(file, 0, use_write_buffer))),
@@ -110,14 +114,18 @@ impl NimbusFS {
         self.last_file_handle
     }
 
-    pub fn parent_name_lookup_result(&self, parent: u64, name: &OsStr) -> std::io::Result<PathBuf> {
+    pub fn parent_name_lookup_result(
+        &self,
+        parent: INode,
+        name: &OsStr,
+    ) -> std::io::Result<PathBuf> {
         let parent_file = self.lookup_ino_result(&parent)?;
         let mut file = parent_file.clone();
         file.push(name);
         Ok(file)
     }
 
-    pub fn lookup_ino_result(&self, ino: &u64) -> std::io::Result<&PathBuf> {
+    pub fn lookup_ino_result(&self, ino: &INode) -> std::io::Result<&PathBuf> {
         match self.ino_file_map.get(ino) {
             Some(path) => Ok(path),
             None => Err(Error::new(
@@ -128,7 +136,7 @@ impl NimbusFS {
     }
 
     // todo: rename to lookup_path
-    pub fn lookup_file_result(&self, path: &PathBuf) -> std::io::Result<&u64> {
+    pub fn lookup_file_result(&self, path: &PathBuf) -> std::io::Result<&INode> {
         match self.file_ino_map.get(path) {
             Some(ino) => Ok(ino),
             None => Err(Error::new(
@@ -138,7 +146,7 @@ impl NimbusFS {
         }
     }
 
-    pub fn lookup_or_create_path(&mut self, path: &PathBuf) -> u64 {
+    pub fn lookup_or_create_path(&mut self, path: &PathBuf) -> INode {
         let result = self.file_ino_map.get(path);
         match result {
             Some(ino) => *ino,
@@ -175,7 +183,7 @@ impl NimbusFS {
 
     pub fn lookup_file_handler_result(
         &mut self,
-        fh: u64,
+        fh: IFileHandle,
     ) -> std::io::Result<&Arc<Mutex<FileHandler>>> {
         match self.file_handlers_map.get(&fh) {
             Some(fh) => Ok(fh),
@@ -188,7 +196,7 @@ impl NimbusFS {
 
     pub fn delete_file_handler_result(
         &mut self,
-        fh: u64,
+        fh: IFileHandle,
     ) -> std::io::Result<Arc<Mutex<FileHandler>>> {
         match self.file_handlers_map.remove(&fh) {
             Some(fh) => Ok(fh),
@@ -214,17 +222,17 @@ impl Fuse for NimbusFS {
         ATTR_TTL
     }
 
-    fn getattr_fs(&mut self, req: &Request<'_>, ino: u64) -> std::io::Result<FileAttr> {
+    fn getattr_fs(&mut self, req: &Request<'_>, ino: INode) -> std::io::Result<FileAttr> {
         let mut attr = self.getattr_path(self.lookup_ino_result(&ino)?)?;
-        attr.ino = ino;
+        attr.ino = ino.into();
         Ok(attr)
     }
 
     fn readdir_fs<'a>(
         &mut self,
         req: &Request<'_>,
-        ino: u64,
-        fh: u64,
+        ino: INode,
+        fh: IFileHandle,
         offset: i64,
         reply: &'a mut ReplyDirectory,
     ) -> std::io::Result<&'a ReplyDirectory> {
@@ -237,7 +245,7 @@ impl Fuse for NimbusFS {
             let file_type = good_entry.file_type()?;
             let ino = self.lookup_or_create_path(&good_entry.path());
             let result = reply.add(
-                ino,
+                ino.into(),
                 offset + counter as i64 + 1,
                 convert_file_type(file_type),
                 good_entry.file_name(),
@@ -252,7 +260,7 @@ impl Fuse for NimbusFS {
     fn lookup_fs(
         &mut self,
         _req: &Request<'_>,
-        parent: u64,
+        parent: INode,
         name: &OsStr,
     ) -> std::io::Result<FileAttr> {
         info!("lookup: lookup called");
@@ -260,7 +268,7 @@ impl Fuse for NimbusFS {
         info!("lookup: filename {:?}", filename);
         let ino = self.lookup_or_create_path(&filename);
         let mut attr = self.getattr_path(&filename)?;
-        attr.ino = ino;
+        attr.ino = ino.into();
         info!("lookup: attr {:?}", attr);
         Ok(attr)
     }
@@ -268,8 +276,8 @@ impl Fuse for NimbusFS {
     fn read_fs(
         &mut self,
         _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
+        ino: INode,
+        fh: IFileHandle,
         offset: i64,
         size: u32,
         flags: i32,
@@ -301,8 +309,8 @@ impl Fuse for NimbusFS {
     fn write_fs(
         &mut self,
         _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
+        ino: INode,
+        fh: IFileHandle,
         offset: i64,
         data: &[u8],
         write_flags: u32,
@@ -331,7 +339,12 @@ impl Fuse for NimbusFS {
         // Write
         file_handler.write(data)
     }
-    fn open_fs(&mut self, _req: &Request<'_>, ino: u64, flags: i32) -> std::io::Result<u64> // might also want to return flags in the future
+    fn open_fs(
+        &mut self,
+        _req: &Request<'_>,
+        ino: INode,
+        flags: i32,
+    ) -> std::io::Result<IFileHandle> // might also want to return flags in the future
     {
         let (options, use_write_buffer) = parse_flag_options(flags);
         let fh = options.open(self.lookup_ino_result(&ino)?)?;
@@ -340,7 +353,7 @@ impl Fuse for NimbusFS {
     fn create_fs(
         &mut self,
         req: &Request<'_>,
-        parent: u64,
+        parent: INode,
         name: &OsStr,
         mode: u32,
         umask: u32,
@@ -351,7 +364,7 @@ impl Fuse for NimbusFS {
         let mut attr = self.getattr_path(&filename)?;
         let ino = self.lookup_or_create_path(&filename);
         let (_, use_write_buffer) = parse_flag_options(flags);
-        attr.ino = ino;
+        attr.ino = ino.into();
         Ok(FileCreate::new(
             attr,
             self.register_file_handle(fh, use_write_buffer),
@@ -360,7 +373,7 @@ impl Fuse for NimbusFS {
     fn setattr_fs(
         &mut self,
         req: &Request<'_>,
-        ino: u64,
+        ino: INode,
         mode: Option<u32>,
         uid: Option<u32>,
         gid: Option<u32>,
@@ -368,7 +381,7 @@ impl Fuse for NimbusFS {
         atime: Option<TimeOrNow>,
         mtime: Option<TimeOrNow>,
         ctime: Option<SystemTime>,
-        fh: Option<u64>,
+        fh: Option<IFileHandle>,
         crtime: Option<SystemTime>,
         chgtime: Option<SystemTime>,
         bkuptime: Option<SystemTime>,
@@ -412,8 +425,8 @@ impl Fuse for NimbusFS {
     fn flush_fs(
         &mut self,
         req: &Request<'_>,
-        ino: u64,
-        fh: u64,
+        ino: INode,
+        fh: IFileHandle,
         lock_owner: u64,
     ) -> std::io::Result<()> {
         let f = self.lookup_file_handler_result(fh)?;
@@ -426,8 +439,8 @@ impl Fuse for NimbusFS {
     fn release_fs(
         &mut self,
         req: &Request<'_>,
-        ino: u64,
-        fh: u64,
+        ino: INode,
+        fh: IFileHandle,
         flags: i32,
         lock_owner: Option<u64>,
         flush: bool,
@@ -440,7 +453,7 @@ impl Fuse for NimbusFS {
     fn mkdir_fs(
         &mut self,
         req: &Request<'_>,
-        parent: u64,
+        parent: INode,
         name: &OsStr,
         mode: u32,
         umask: u32,
@@ -451,7 +464,7 @@ impl Fuse for NimbusFS {
         self.lookup_fs(req, parent, name)
     }
 
-    fn rmdir_fs(&mut self, req: &Request<'_>, parent: u64, name: &OsStr) -> std::io::Result<()> {
+    fn rmdir_fs(&mut self, req: &Request<'_>, parent: INode, name: &OsStr) -> std::io::Result<()> {
         let dir_path = self.parent_name_lookup_result(parent, name)?;
         info!(
             "rmdir: there are {:?} files in the dir",
@@ -468,9 +481,9 @@ impl Fuse for NimbusFS {
     fn rename_fs(
         &mut self,
         req: &Request<'_>,
-        parent: u64,
+        parent: INode,
         name: &OsStr,
-        new_parent: u64,
+        new_parent: INode,
         new_name: &OsStr,
         flags: u32,
     ) -> std::io::Result<()> {
@@ -495,7 +508,7 @@ impl Fuse for NimbusFS {
     fn symlink_fs(
         &mut self,
         req: &Request<'_>,
-        parent: u64,
+        parent: INode,
         name: &OsStr,
         link: &Path,
     ) -> std::io::Result<FileAttr> {
@@ -503,14 +516,18 @@ impl Fuse for NimbusFS {
         std::os::unix::fs::symlink(link, sym_path)?;
         self.lookup_fs(req, parent, name)
     }
-    fn unlink_fs(&mut self, req: &Request<'_>, parent: u64, name: &OsStr) -> std::io::Result<()> {
+    fn unlink_fs(&mut self, req: &Request<'_>, parent: INode, name: &OsStr) -> std::io::Result<()> {
         info!("unlink called");
         let file_path = self.parent_name_lookup_result(parent, name)?;
         fs::remove_file(file_path.clone())?;
         // self.remove_path(&file_path)?;
         Ok(())
     }
-    fn readlink_fs(&mut self, req: &Request<'_>, ino: u64) -> std::io::Result<std::path::PathBuf> {
+    fn readlink_fs(
+        &mut self,
+        req: &Request<'_>,
+        ino: INode,
+    ) -> std::io::Result<std::path::PathBuf> {
         let file = self.lookup_ino_result(&ino)?;
         fs::read_link(file)
     }
@@ -530,7 +547,7 @@ impl Filesystem for NimbusFS {
     }
 
     fn getattr(&mut self, req: &Request<'_>, ino: u64, reply: ReplyAttr) {
-        match self.getattr_fs(req, ino) {
+        match self.getattr_fs(req, ino.into()) {
             Ok(attr) => reply.attr(&self.duration(), &attr),
             Err(error) => reply.error(parse_error_cint(error)),
         };
@@ -544,14 +561,14 @@ impl Filesystem for NimbusFS {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        match self.readdir_fs(req, ino, fh, offset, &mut reply) {
+        match self.readdir_fs(req, ino.into(), fh.into(), offset, &mut reply) {
             Ok(_) => reply.ok(),
             Err(error) => reply.error(parse_error_cint(error)),
         }
     }
 
     fn lookup(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        match self.lookup_fs(req, parent, name) {
+        match self.lookup_fs(req, parent.into(), name) {
             Ok(attr) => {
                 reply.entry(&ATTR_TTL, &attr, self.generation);
                 info!("reply: {:?}", attr);
@@ -571,7 +588,7 @@ impl Filesystem for NimbusFS {
         lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        match self.read_fs(req, ino, fh, offset, size, flags, lock_owner) {
+        match self.read_fs(req, ino.into(), fh.into(), offset, size, flags, lock_owner) {
             Ok(data) => reply.data(&data.into_boxed_slice()),
             Err(error) => reply.error(parse_error_cint(error)),
         }
@@ -589,15 +606,24 @@ impl Filesystem for NimbusFS {
         lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        match self.write_fs(req, ino, fh, offset, data, write_flags, flags, lock_owner) {
+        match self.write_fs(
+            req,
+            ino.into(),
+            fh.into(),
+            offset,
+            data,
+            write_flags,
+            flags,
+            lock_owner,
+        ) {
             Ok(write_size) => reply.written(write_size.try_into().expect("Overflow")),
             Err(error) => reply.error(parse_error_cint(error)),
         }
     }
 
     fn open(&mut self, req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
-        match self.open_fs(req, ino, flags) {
-            Ok(fh) => reply.opened(fh, 0), // todo: check if 0 is the right flag to return here
+        match self.open_fs(req, ino.into(), flags) {
+            Ok(fh) => reply.opened(fh.into(), 0), // todo: check if 0 is the right flag to return here
             Err(error) => reply.error(parse_error_cint(error)),
         };
     }
@@ -612,8 +638,8 @@ impl Filesystem for NimbusFS {
         flags: i32,
         reply: ReplyCreate,
     ) {
-        match self.create_fs(req, parent, name, mode, umask, flags) {
-            Ok(file) => reply.created(&ATTR_TTL, &file.attr, self.generation, file.fh, 0), // flags?
+        match self.create_fs(req, parent.into(), name, mode, umask, flags) {
+            Ok(file) => reply.created(&ATTR_TTL, &file.attr, self.generation, file.fh.into(), 0), // flags?
             Err(error) => reply.error(parse_error_cint(error)),
         }
     }
@@ -637,7 +663,19 @@ impl Filesystem for NimbusFS {
         reply: ReplyAttr,
     ) {
         match self.setattr_fs(
-            req, ino, mode, uid, gid, size, atime, mtime, ctime, fh, crtime, chgtime, bkuptime,
+            req,
+            ino.into(),
+            mode,
+            uid,
+            gid,
+            size,
+            atime,
+            mtime,
+            ctime,
+            fh.map(|x| x.into()),
+            crtime,
+            chgtime,
+            bkuptime,
             flags,
         ) {
             Ok(attr) => reply.attr(&self.duration(), &attr),
@@ -646,7 +684,7 @@ impl Filesystem for NimbusFS {
     }
 
     fn flush(&mut self, req: &Request<'_>, ino: u64, fh: u64, lock_owner: u64, reply: ReplyEmpty) {
-        match self.flush_fs(req, ino, fh, lock_owner) {
+        match self.flush_fs(req, ino.into(), fh.into(), lock_owner) {
             Ok(_) => reply.ok(),
             Err(error) => reply.error(parse_error_cint(error)),
         }
@@ -662,7 +700,7 @@ impl Filesystem for NimbusFS {
         flush: bool,
         reply: ReplyEmpty,
     ) {
-        match self.release_fs(req, ino, fh, flags, lock_owner, flush) {
+        match self.release_fs(req, ino.into(), fh.into(), flags, lock_owner, flush) {
             Ok(_) => reply.ok(),
             Err(error) => reply.error(parse_error_cint(error)),
         }
@@ -681,14 +719,14 @@ impl Filesystem for NimbusFS {
         umask: u32,
         reply: ReplyEntry,
     ) {
-        match self.mkdir_fs(req, parent, name, mode, umask) {
+        match self.mkdir_fs(req, parent.into(), name, mode, umask) {
             Ok(attr) => reply.entry(&ATTR_TTL, &attr, 0),
             Err(error) => reply.error(parse_error_cint(error)),
         }
     }
 
     fn rmdir(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        match self.rmdir_fs(req, parent, name) {
+        match self.rmdir_fs(req, parent.into(), name) {
             Ok(_) => reply.ok(),
             Err(error) => reply.error(parse_error_cint(error)),
         }
@@ -704,7 +742,7 @@ impl Filesystem for NimbusFS {
         flags: u32,
         reply: ReplyEmpty,
     ) {
-        match self.rename_fs(req, parent, name, new_parent, new_name, flags) {
+        match self.rename_fs(req, parent.into(), name, new_parent.into(), new_name, flags) {
             Ok(_) => reply.ok(),
             Err(error) => reply.error(parse_error_cint(error)),
         }
@@ -717,19 +755,19 @@ impl Filesystem for NimbusFS {
         link: &Path,
         reply: ReplyEntry,
     ) {
-        match self.symlink_fs(req, parent, name, link) {
+        match self.symlink_fs(req, parent.into(), name, link) {
             Ok(attr) => reply.entry(&ATTR_TTL, &attr, 0),
             Err(error) => reply.error(parse_error_cint(error)),
         }
     }
     fn unlink(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        match self.unlink_fs(req, parent, name) {
+        match self.unlink_fs(req, parent.into(), name) {
             Ok(_) => reply.ok(),
             Err(error) => reply.error(parse_error_cint(error)),
         }
     }
     fn readlink(&mut self, req: &Request<'_>, ino: u64, reply: ReplyData) {
-        match self.readlink_fs(req, ino) {
+        match self.readlink_fs(req, ino.into()) {
             Ok(loc) => reply.data(
                 loc.to_str()
                     .expect("Unable to convert PathBuf to str")
