@@ -236,7 +236,7 @@ impl Fuse for NimbusFS {
             let ino = self.lookup_or_create_path(&good_entry.path());
             let result = reply.add(
                 ino,
-                counter as i64 + 1,
+                offset + counter as i64 + 1,
                 convert_file_type(file_type),
                 good_entry.file_name(),
             );
