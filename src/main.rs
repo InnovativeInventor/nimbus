@@ -1,8 +1,9 @@
-use log::info;
+use log::{info, trace};
 use std::path::PathBuf;
+use std::sync::{Arc, Barrier};
 use structopt::StructOpt;
 
-use fuser::MountOption;
+use fuser::{MountOption, Session};
 
 use nimbus::files::NimbusFS;
 
@@ -21,10 +22,32 @@ fn main() {
     let args = Opt::from_args();
 
     info!("Args parsed");
-    fuser::mount2(
-        NimbusFS::default(args.local_storage, args.mount_directory.clone()),
-        args.mount_directory.to_str().unwrap(),
-        &[MountOption::AutoUnmount, MountOption::DefaultPermissions],
+    let nimbus = NimbusFS::default(args.local_storage, args.mount_directory.clone());
+
+    let session = Session::new(
+        nimbus,
+        &args.mount_directory,
+        &[
+            MountOption::DefaultPermissions,
+            MountOption::DirSync,
+            MountOption::Sync,
+        ], // MountOption::AutoUnmount,
     )
-    .unwrap();
+    .expect("Could not create session");
+
+    let interrupt = Arc::new(Barrier::new(2));
+
+    let c = Arc::clone(&interrupt);
+    ctrlc::set_handler(move || {
+        c.wait();
+        trace!("Ctrl-C recieved, forwarding to main thread!");
+    })
+    .expect("Error setting Ctrl-C handler");
+
+    let bg = session.spawn().expect("Session failed to spawn");
+
+    interrupt.wait();
+    info!("Ctrl-C recieved, gracefully exiting!");
+    bg.join();
+    info!("Cleanup successful, exit complete!");
 }
