@@ -93,37 +93,10 @@ impl NimbusFS {
         nimbus
     }
 
-    // pub fn fresh_ino(&mut self) -> u64 {
-    //     self.last_alloced_ino += 1;
-    //     self.last_alloced_ino
-    // }
-
     pub fn register_ino(&mut self, ino: u64, path: PathBuf) {
         self.ino_file_map.insert(ino, path.clone());
         self.file_ino_map.insert(path, ino);
     }
-
-    // pub fn parent_name_lookup(&mut self, parent: u64, name: &OsStr) -> Option<PathBuf> {
-    //     if let Some(parent_file) = self.lookup_ino(&parent) {
-    //         // todo: might have to store all parents at some point
-    //         info!("Hit on parent!");
-    //         let mut file = parent_file.clone();
-    //         file.push(name);
-    //         info!("Child: {:?}", file);
-    //         Some(file)
-    //     } else {
-    //         None
-    //     }
-    // }
-
-    // pub fn lookup_ino(&self, ino: &u64) -> Option<&PathBuf> {
-    //     self.ino_file_map.get(ino)
-    // }
-
-    // // todo: rename to lookup_path
-    // pub fn lookup_file(&self, path: &PathBuf) -> Option<&u64> {
-    //     self.file_ino_map.get(path)
-    // }
 
     pub fn register_file_handle(&mut self, file: std::fs::File) -> u64 {
         self.last_file_handle += 1;
@@ -137,15 +110,6 @@ impl NimbusFS {
         self.last_file_handle
     }
 
-    // pub fn lookup_file_handler(&mut self, fh: u64) -> Option<&Arc<Mutex<FileHandler>>> {
-    //     self.file_handlers_map.get(&fh)
-    // }
-
-    // pub fn delete_file_handler(&mut self, fh: u64) -> Option<Arc<Mutex<FileHandler>>> {
-    //     self.file_handlers_map.remove(&fh)
-    // }
-
-    // Result variants
     pub fn parent_name_lookup_result(
         &mut self,
         parent: u64,
@@ -474,24 +438,6 @@ impl Fuse for NimbusFS {
         let file = self.lookup_ino_result(&ino)?;
         fs::read_link(file)
     }
-    //     fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
-    //         debug!("Calling readlink(ino: {:#x?})", ino);
-    //         if let Some(file) = self.lookup_ino(&ino) {
-    //             info!("Reading symlink at: {:?}", file);
-    //             match fs::read_link(file) {
-    //                 Ok(loc) => {
-    //                     reply.data(
-    //                         loc.to_str()
-    //                             .expect("Unable to convert PathBuf to str")
-    //                             .as_bytes(),
-    //                     );
-    //                 }
-    //                 Err(_) => crate::unhandled!(),
-    //             }
-    //         } else {
-    //             reply.error(ENOSYS);
-    //         }
-    //     }
 }
 
 // This mostly does error handling
@@ -713,19 +659,3 @@ impl Filesystem for NimbusFS {
         }
     }
 }
-
-// impl Filesystem for NimbusFS {
-
-//     // fn destroy(&mut self) {
-//     //     info!("Leaving filesystem and unmounting!");
-//     // }
-
-//     // fn opendir(&mut self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: ReplyOpen) {
-//     //     crate::unhandled!("Unimplemented opendir() call");
-//     //     reply.opened(0, 0);
-//     // }
-//     // fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
-//     //     crate::unhandled!("Unimplemented fstatfs() call");
-//     //     reply.statfs(0, 0, 0, 0, 0, 512, 255, 0);
-//     // }
-// }
