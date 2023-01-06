@@ -18,7 +18,7 @@ impl FileHandler {
             FileHandler {
                 file: None,
                 offset: offset,
-                write: Some(BufWriter::with_capacity(4096 * 64, file)),
+                write: Some(BufWriter::with_capacity(4096 * 32, file)),
             }
         } else {
             FileHandler {
