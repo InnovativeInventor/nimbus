@@ -46,6 +46,7 @@ impl INode {
 pub struct IFileHandle {
     index: u64,
 }
+
 impl const From<u64> for IFileHandle {
     fn from(index: u64) -> Self {
         IFileHandle { index }
@@ -64,6 +65,29 @@ impl IFileHandle {
     }
 }
 
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub struct IDirHandle {
+    index: u64,
+}
+
+impl const From<u64> for IDirHandle {
+    fn from(index: u64) -> Self {
+        IDirHandle { index }
+    }
+}
+
+impl const Into<u64> for IDirHandle {
+    fn into(self) -> u64 {
+        self.index
+    }
+}
+
+impl IDirHandle {
+    pub fn inc(&mut self) {
+        self.index += 1;
+    }
+}
+
 pub trait Fuse {
     fn duration(&mut self) -> Duration;
     fn init_fs(&mut self, _req: &Request<'_>, _config: &mut KernelConfig) -> Result<()> {
@@ -76,7 +100,7 @@ pub trait Fuse {
         &mut self,
         req: &Request<'_>,
         ino: INode,
-        fh: IFileHandle,
+        fh: IDirHandle,
         offset: i64,
         reply: &'a mut ReplyDirectory,
     ) -> std::io::Result<&'a ReplyDirectory>;
@@ -158,6 +182,20 @@ pub trait Fuse {
         flags: i32,
         lock_owner: Option<u64>,
         flush: bool,
+    ) -> std::io::Result<()>;
+
+    fn opendir_fs(
+        &mut self,
+        req: &Request<'_>,
+        ino: INode,
+        _flags: i32,
+    ) -> std::io::Result<IDirHandle>;
+    fn releasedir_fs(
+        &mut self,
+        req: &Request<'_>,
+        ino: INode,
+        fh: IDirHandle,
+        flags: i32,
     ) -> std::io::Result<()>;
 
     fn mkdir_fs(

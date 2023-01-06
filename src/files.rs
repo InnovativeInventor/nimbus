@@ -8,13 +8,8 @@ use std::io::{Error, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-// use std::thread;
 
-// todo: handle truncate flag
-use libc::{
-    c_int, EISDIR, ENAMETOOLONG, ENOENT, ENOSYS, EPERM, O_ACCMODE, O_APPEND, O_RDONLY, O_RDWR,
-    O_WRONLY, PATH_MAX,
-}; // O_EXEC, O_SEARCH,
+use libc::{c_int, ENOSYS};
 use std::path::PathBuf;
 
 use chrono::prelude::*;
@@ -29,7 +24,7 @@ use log::{debug, error, info, trace, warn};
 
 use crate::convert::{convert_file_type, convert_metadata, parse_flag_options};
 use crate::file_handler::FileHandler;
-use crate::fuse::{parse_error_cint, FileCreate, Fuse, IFileHandle, INode};
+use crate::fuse::{parse_error_cint, FileCreate, Fuse, IDirHandle, IFileHandle, INode};
 use crate::index::{CanonicalProjectName, Index};
 
 const ROOT_DIR: INode = (1 as u64).into();
@@ -56,7 +51,11 @@ pub struct NimbusFS {
     /// Map containing inode-pathbuf mappings
     ino_file_map: FxHashMap<INode, PathBuf>,
     file_ino_map: FxHashMap<PathBuf, INode>,
+
+    /// Index locks
     index: Arc<Mutex<Index>>,
+    /// Reference counting for the index locks (do we need atomic?)
+    index_refs: FxHashMap<CanonicalProjectName, u64>,
 
     /// Keep track of file handlers
     file_handlers_map: FxHashMap<IFileHandle, Arc<Mutex<FileHandler>>>,
@@ -82,6 +81,7 @@ impl NimbusFS {
             ino_file_map: FxHashMap::default(),
             file_ino_map: FxHashMap::default(),
             index: Arc::new(Mutex::new(Index::new())),
+            index_refs: FxHashMap::default(),
             file_handlers_map: FxHashMap::default(),
             last_file_handle: 0.into(),
             last_ino_alloc: ROOT_DIR,
@@ -97,8 +97,9 @@ impl NimbusFS {
         Arc::clone(&self.index)
     }
 
-    pub fn canonicize_project_name(&self, path: PathBuf) -> CanonicalProjectName {
-        path.strip_prefix(self.local_storage.clone())
+    pub fn canonicize_project_name(&self, path: &PathBuf) -> CanonicalProjectName {
+        path.clone()
+            .strip_prefix(self.local_storage.clone())
             .expect("Unable to canonicize project name (strip_prefix)")
             .components()
             .find_map(|c| match c {
@@ -107,6 +108,30 @@ impl NimbusFS {
             })
             .expect("Unable to canonicize project name (find_map)")
             .into()
+    }
+
+    pub fn inc_project_ref(&mut self, project: CanonicalProjectName) {
+        match self.index_refs.get_mut(&project) {
+            Some(mut inc) => *inc += 1,
+            None => {
+                if self.index_refs.insert(project, 1).is_some() {
+                    panic!("should not happen");
+                };
+            }
+        }
+    }
+
+    pub fn dec_project_ref(&mut self, project: CanonicalProjectName) {
+        match self.index_refs.get_mut(&project) {
+            Some(mut dec) => {
+                if *dec > 0 {
+                    *dec -= 1;
+                } else {
+                    panic!("reference counting decrement failed/overflowed!");
+                }
+            }
+            None => panic!("reference counting decrement failed!"),
+        }
     }
 
     // pub fn get_path(&self, path)
@@ -252,7 +277,7 @@ impl Fuse for NimbusFS {
         &mut self,
         req: &Request<'_>,
         ino: INode,
-        fh: IFileHandle,
+        fh: IDirHandle,
         offset: i64,
         reply: &'a mut ReplyDirectory,
     ) -> std::io::Result<&'a ReplyDirectory> {
@@ -368,6 +393,13 @@ impl Fuse for NimbusFS {
     {
         let (options, use_write_buffer) = parse_flag_options(flags);
         let fh = options.open(self.lookup_ino_result(&ino)?)?;
+
+        if ino != ROOT_DIR {
+            let path = self.lookup_ino_result(&ino)?;
+            let project_name = self.canonicize_project_name(path);
+            self.inc_project_ref(project_name);
+        }
+
         Ok(self.register_file_handle(fh, use_write_buffer))
     }
     fn create_fs(
@@ -468,7 +500,42 @@ impl Fuse for NimbusFS {
         let f = self.delete_file_handler_result(fh)?;
         let mut file_handler = f.lock().unwrap();
         file_handler.flush()?; // maybe check bool flag?
-        file_handler.sync_all()
+        file_handler.sync_all()?;
+
+        if ino != ROOT_DIR {
+            let path = self.lookup_ino_result(&ino)?;
+            let project_name = self.canonicize_project_name(path);
+            self.inc_project_ref(project_name);
+        }
+
+        Ok(())
+    }
+    fn opendir_fs(
+        &mut self,
+        req: &Request<'_>,
+        ino: INode,
+        _flags: i32,
+    ) -> std::io::Result<IDirHandle> {
+        if ino != ROOT_DIR {
+            let path = self.lookup_ino_result(&ino)?;
+            let project_name = self.canonicize_project_name(path);
+            self.inc_project_ref(project_name);
+        }
+        Ok(0.into())
+    }
+    fn releasedir_fs(
+        &mut self,
+        req: &Request<'_>,
+        ino: INode,
+        fh: IDirHandle,
+        flags: i32,
+    ) -> std::io::Result<()> {
+        if ino != ROOT_DIR {
+            let path = self.lookup_ino_result(&ino)?;
+            let project_name = self.canonicize_project_name(path);
+            self.dec_project_ref(project_name);
+        }
+        Ok(())
     }
     fn mkdir_fs(
         &mut self,
@@ -727,7 +794,17 @@ impl Filesystem for NimbusFS {
     }
 
     fn opendir(&mut self, req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
-        reply.error(ENOSYS);
+        match self.opendir_fs(req, ino.into(), flags) {
+            Ok(fh) => reply.opened(fh.into(), 0),
+            Err(error) => reply.error(parse_error_cint(error)),
+        }
+    }
+
+    fn releasedir(&mut self, req: &Request<'_>, ino: u64, fh: u64, flags: i32, reply: ReplyEmpty) {
+        match self.releasedir_fs(req, ino.into(), fh.into(), flags) {
+            Ok(_) => reply.ok(),
+            Err(error) => reply.error(parse_error_cint(error)),
+        }
     }
 
     fn mkdir(

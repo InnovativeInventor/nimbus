@@ -50,6 +50,8 @@ pub fn convert_metadata(metadata: &fs::Metadata) -> FileAttr {
     }
 }
 
+// todo: handle truncate flag
+// todo: O_EXEC, O_SEARCH
 pub fn parse_flag_options<'a>(flags: i32) -> (OpenOptions, bool) {
     let mut open_options = OpenOptions::new();
     let use_write_buffer = match flags & O_ACCMODE {
