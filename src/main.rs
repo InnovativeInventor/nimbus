@@ -24,7 +24,7 @@ fn main() {
     fuser::mount2(
         NimbusFS::default(args.local_storage, args.mount_directory.clone()),
         args.mount_directory.to_str().unwrap(),
-        &[MountOption::AutoUnmount],
+        &[MountOption::AutoUnmount, MountOption::DefaultPermissions],
     )
     .unwrap();
 }
