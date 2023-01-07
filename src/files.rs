@@ -129,6 +129,7 @@ impl NimbusFS {
                 } else {
                     panic!("reference counting decrement failed/overflowed!");
                 }
+                info!("project counter for {:?} is at {}", project, dec);
             }
             None => panic!("reference counting decrement failed!"),
         }
@@ -505,7 +506,7 @@ impl Fuse for NimbusFS {
         if ino != ROOT_DIR {
             let path = self.lookup_ino_result(&ino)?;
             let project_name = self.canonicize_project_name(path);
-            self.inc_project_ref(project_name);
+            self.dec_project_ref(project_name);
         }
 
         Ok(())
@@ -872,5 +873,8 @@ impl Filesystem for NimbusFS {
             ),
             Err(error) => reply.error(parse_error_cint(error)),
         }
+    }
+    fn forget(&mut self, _req: &Request<'_>, _ino: u64, _nlookup: u64) {
+        info!("forget called!");
     }
 }
