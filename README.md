@@ -31,4 +31,4 @@ By default, if there is space, all projects will be cached/stored on disk.
 ## Architecture 
 TODO: fill in here.
 
-[^1]: Until cloning is invented, this seems like a reasonable limitation.
+[^1]: Until telepathy and human cloning is invented, this seems like a reasonable limitation.
