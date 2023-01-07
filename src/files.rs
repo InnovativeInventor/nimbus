@@ -124,12 +124,12 @@ impl NimbusFS {
     pub fn dec_project_ref(&mut self, project: CanonicalProjectName) {
         match self.index_refs.get_mut(&project) {
             Some(mut dec) => {
+                info!("project counter for {:?} is at {}", project, dec);
                 if *dec > 0 {
                     *dec -= 1;
                 } else {
                     panic!("reference counting decrement failed/overflowed!");
                 }
-                info!("project counter for {:?} is at {}", project, dec);
             }
             None => panic!("reference counting decrement failed!"),
         }
@@ -418,11 +418,19 @@ impl Fuse for NimbusFS {
         let ino = self.lookup_or_create_path(&filename);
         let (_, use_write_buffer) = parse_flag_options(flags);
         attr.ino = ino.into();
+
+        if ino != ROOT_DIR {
+            let path = self.lookup_ino_result(&ino)?;
+            let project_name = self.canonicize_project_name(path);
+            self.inc_project_ref(project_name);
+        }
+
         Ok(FileCreate::new(
             attr,
             self.register_file_handle(fh, use_write_buffer),
         ))
     }
+
     fn setattr_fs(
         &mut self,
         req: &Request<'_>,
@@ -440,21 +448,7 @@ impl Fuse for NimbusFS {
         bkuptime: Option<SystemTime>,
         flags: Option<u32>,
     ) -> std::io::Result<FileAttr> {
-        let now = SystemTime::now();
-        let mut times = FileTimes::new();
-
-        if let Some(atime_p) = atime {
-            times = match atime_p {
-                SpecificTime(t) => times.set_accessed(t),
-                Now => times.set_accessed(now),
-            };
-        }
-        if let Some(mtime_p) = atime {
-            times = match mtime_p {
-                SpecificTime(t) => times.set_modified(t),
-                Now => times.set_modified(now),
-            };
-        }
+        let times = construct_file_time(atime, mtime, ctime);
 
         // Currently, the file handler option is ignored
         let filename = self.lookup_ino_result(&ino)?;
@@ -877,4 +871,27 @@ impl Filesystem for NimbusFS {
     fn forget(&mut self, _req: &Request<'_>, _ino: u64, _nlookup: u64) {
         info!("forget called!");
     }
+}
+
+fn construct_file_time(
+    atime: Option<TimeOrNow>,
+    mtime: Option<TimeOrNow>,
+    ctime: Option<SystemTime>,
+) -> FileTimes {
+    let now = SystemTime::now();
+    let mut times = FileTimes::new();
+
+    if let Some(atime_p) = atime {
+        times = match atime_p {
+            SpecificTime(t) => times.set_accessed(t),
+            Now => times.set_accessed(now),
+        };
+    }
+    if let Some(mtime_p) = mtime {
+        times = match mtime_p {
+            SpecificTime(t) => times.set_modified(t),
+            Now => times.set_modified(now),
+        };
+    }
+    times
 }
