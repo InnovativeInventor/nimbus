@@ -54,6 +54,7 @@ async fn main() {
             MountOption::DefaultPermissions,
             MountOption::DirSync,
             MountOption::Sync,
+            MountOption::NoAtime,
         ], // MountOption::AutoUnmount,
     )
     .expect("Could not create session");

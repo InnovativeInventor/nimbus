@@ -1,9 +1,11 @@
 use std::fmt::Arguments;
 use std::fs::File;
+use std::fs::Metadata;
 use std::io::{
     BorrowedCursor, BufWriter, Bytes, Chain, IoSlice, IoSliceMut, Read, Result, Seek, SeekFrom,
     Take, Write,
 };
+use std::pin::Pin;
 
 pub struct FileHandler {
     file: Option<std::fs::File>,
@@ -35,6 +37,15 @@ impl FileHandler {
         } else {
             let writer = self.write.as_ref().expect("sync_all unexpectedly failed!");
             writer.get_ref().sync_all()
+        }
+    }
+    pub fn metadata(&mut self) -> Result<Metadata> {
+        if self.file.is_some() {
+            let file = self.file.as_ref().expect("sync_all unexpectedly failed!");
+            file.metadata()
+        } else {
+            let writer = self.write.as_mut().expect("sync_all unexpectedly failed!");
+            writer.get_mut().metadata()
         }
     }
 }

@@ -1,3 +1,4 @@
+use log::{debug, error, info, trace, warn};
 use std::fs;
 use std::fs::{File, OpenOptions};
 use std::ops::Add;
@@ -31,6 +32,7 @@ pub fn convert_file_type(file_type: std::fs::FileType) -> fuser::FileType {
 
 pub fn convert_metadata(metadata: &fs::Metadata) -> FileAttr {
     // todo: better error handling
+    info!("returned size: {}", metadata.len());
     FileAttr {
         ino: metadata.ino(),
         size: metadata.len(),

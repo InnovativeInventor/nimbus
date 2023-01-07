@@ -58,6 +58,7 @@ pub struct NimbusFS {
     index_refs: FxHashMap<CanonicalProjectName, u64>,
 
     /// Keep track of file handlers
+    ino_open_file_handlers: FxHashMap<INode, Vec<IFileHandle>>,
     file_handlers_map: FxHashMap<IFileHandle, Arc<Mutex<FileHandler>>>,
     /// An incrementing counter so we can generate unique file handle ids
     last_file_handle: IFileHandle,
@@ -82,6 +83,7 @@ impl NimbusFS {
             file_ino_map: FxHashMap::default(),
             index: Arc::new(Mutex::new(Index::new())),
             index_refs: FxHashMap::default(),
+            ino_open_file_handlers: FxHashMap::default(),
             file_handlers_map: FxHashMap::default(),
             last_file_handle: 0.into(),
             last_ino_alloc: ROOT_DIR,
@@ -127,6 +129,7 @@ impl NimbusFS {
                 info!("project counter for {:?} is at {}", project, dec);
                 if *dec > 0 {
                     *dec -= 1;
+                    info!("project counter for {:?} is *now* at {}", project, dec);
                 } else {
                     panic!("reference counting decrement failed/overflowed!");
                 }
@@ -145,19 +148,6 @@ impl NimbusFS {
     pub fn fresh_ino(&mut self) -> INode {
         self.last_ino_alloc.inc();
         self.last_ino_alloc
-    }
-
-    pub fn register_file_handle(
-        &mut self,
-        file: std::fs::File,
-        use_write_buffer: bool,
-    ) -> IFileHandle {
-        self.last_file_handle.inc();
-        self.file_handlers_map.insert(
-            self.last_file_handle,
-            Arc::new(Mutex::new(FileHandler::new(file, 0, use_write_buffer))),
-        );
-        self.last_file_handle
     }
 
     pub fn parent_name_lookup_result(
@@ -227,6 +217,32 @@ impl NimbusFS {
         }
     }
 
+    pub fn register_file_handler(
+        &mut self,
+        ino: INode,
+        file: std::fs::File,
+        use_write_buffer: bool,
+    ) -> IFileHandle {
+        self.last_file_handle.inc();
+        self.file_handlers_map.insert(
+            self.last_file_handle.clone(),
+            Arc::new(Mutex::new(FileHandler::new(file, 0, use_write_buffer))),
+        );
+        match self.ino_open_file_handlers.get_mut(&ino) {
+            Some(handlers) => handlers.push(self.last_file_handle.clone()),
+            None => {
+                if self
+                    .ino_open_file_handlers
+                    .insert(ino, vec![self.last_file_handle.clone()])
+                    .is_some()
+                {
+                    panic!("should not happen")
+                }
+            }
+        }
+        self.last_file_handle
+    }
+
     pub fn lookup_file_handler_result(
         &mut self,
         fh: IFileHandle,
@@ -242,8 +258,16 @@ impl NimbusFS {
 
     pub fn delete_file_handler_result(
         &mut self,
+        ino: INode,
         fh: IFileHandle,
     ) -> std::io::Result<Arc<Mutex<FileHandler>>> {
+        match self.ino_open_file_handlers.get_mut(&ino) {
+            Some(handlers) => handlers.retain(|x| x != &fh),
+            None => {
+                panic!("could not close file handler!")
+            }
+        }
+
         match self.file_handlers_map.remove(&fh) {
             Some(fh) => Ok(fh),
             None => Err(Error::new(
@@ -251,6 +275,24 @@ impl NimbusFS {
                 "file handler deletion failed: file handler not found",
             )),
         }
+    }
+
+    pub fn flush_associated_file_handlers(&mut self, ino: INode) -> std::io::Result<()> {
+        match self.ino_open_file_handlers.get_mut(&ino) {
+            Some(handlers) => {
+                for x in handlers.clone() {
+                    let fh = self
+                        .lookup_file_handler_result(x)
+                        .expect("failed to flush file handles");
+                    let arc_file_handler = Arc::clone(fh);
+                    let mut file_handler = arc_file_handler.lock().unwrap();
+                    file_handler.flush()?;
+                    file_handler.sync_all()?;
+                }
+            }
+            None => (),
+        }
+        Ok(())
     }
 
     pub fn count_file_handlers(&mut self) -> usize {
@@ -269,6 +311,7 @@ impl Fuse for NimbusFS {
     }
 
     fn getattr_fs(&mut self, req: &Request<'_>, ino: INode) -> std::io::Result<FileAttr> {
+        self.flush_associated_file_handlers(ino)?;
         let mut attr = self.getattr_path(self.lookup_ino_result(&ino)?)?;
         attr.ino = ino.into();
         Ok(attr)
@@ -313,6 +356,7 @@ impl Fuse for NimbusFS {
         let filename = self.parent_name_lookup_result(parent, name)?;
         info!("lookup: filename {:?}", filename);
         let ino = self.lookup_or_create_path(&filename);
+        self.flush_associated_file_handlers(ino)?;
         let mut attr = self.getattr_path(&filename)?;
         attr.ino = ino.into();
         info!("lookup: attr {:?}", attr);
@@ -334,18 +378,27 @@ impl Fuse for NimbusFS {
         let mut file_handler = arc_file_handler.lock().unwrap();
 
         // Seek to position
-        // let file_handler_offset = file_handler.offset;
-        // file_handler.offset = file_handler // corrupt
-        //     .file
-        //     .seek(SeekFrom::Current(
-        //         (offset - file_handler_offset).try_into().expect("Overflow"),
-        //     ))?
-        //     .try_into()
-        //     .expect("Overflow");
         file_handler.offset = file_handler
             .seek(SeekFrom::Start(offset.try_into().expect("Overflow")))?
             .try_into()
             .expect("Overflow");
+
+        // from fuser examples; this is not correct!
+        // file_handler.offset = file_handler
+        //     .seek(SeekFrom::Start(offset.try_into().expect("Overflow")))?
+        //     .try_into()
+        //     .expect("Overflow");
+        // let mut actual_size = size;
+        // let file_size: u32 = file_handler
+        //     .metadata()?
+        //     .len()
+        //     .try_into()
+        //     .expect("Over/underflow");
+        // if (file_size as i64 > offset) && (file_size as i64 - offset) < size.into() {
+        //     actual_size = file_size - offset as u32;
+        // }
+        // let mut data: Vec<u8> = vec![0; actual_size.try_into().expect("Overflow")];
+        // file_handler.read_exact(&mut data)?;
 
         // Read
         let mut data: Vec<u8> = vec![0; size.try_into().expect("Overflow")];
@@ -401,7 +454,7 @@ impl Fuse for NimbusFS {
             self.inc_project_ref(project_name);
         }
 
-        Ok(self.register_file_handle(fh, use_write_buffer))
+        Ok(self.register_file_handler(ino, fh, use_write_buffer))
     }
     fn create_fs(
         &mut self,
@@ -427,7 +480,7 @@ impl Fuse for NimbusFS {
 
         Ok(FileCreate::new(
             attr,
-            self.register_file_handle(fh, use_write_buffer),
+            self.register_file_handler(ino, fh, use_write_buffer),
         ))
     }
 
@@ -492,7 +545,7 @@ impl Fuse for NimbusFS {
         lock_owner: Option<u64>,
         flush: bool,
     ) -> std::io::Result<()> {
-        let f = self.delete_file_handler_result(fh)?;
+        let f = self.delete_file_handler_result(ino, fh)?;
         let mut file_handler = f.lock().unwrap();
         file_handler.flush()?; // maybe check bool flag?
         file_handler.sync_all()?;
