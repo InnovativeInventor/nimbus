@@ -1,11 +1,10 @@
 use crate::config::{read_config, Config};
-use crate::files::NimbusFS;
 use crate::index::{Index, LockStatus::*};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::{Arc, Barrier, Mutex};
-use warp::{Filter, Server};
+use std::sync::{Arc, Mutex};
+use warp::Filter;
 
 pub async fn build(index: Arc<Mutex<Index>>, endpoint: String) {
     // Setup routes

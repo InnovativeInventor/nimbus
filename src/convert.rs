@@ -32,7 +32,7 @@ pub fn convert_file_type(file_type: std::fs::FileType) -> fuser::FileType {
 
 pub fn convert_metadata(metadata: &fs::Metadata) -> FileAttr {
     // todo: better error handling
-    info!("returned size: {}", metadata.len());
+    // info!("returned size: {}", metadata.len());
     FileAttr {
         ino: metadata.ino(),
         size: metadata.len(),

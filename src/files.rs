@@ -1,5 +1,8 @@
 use nix::fcntl::renameat2;
 use nix::unistd::chown;
+use procfs::process::Process;
+use procfs::ProcError;
+use procfs::ProcError::*;
 use rustc_hash::FxHashMap;
 use std::ffi::OsStr;
 use std::fs;
@@ -7,6 +10,7 @@ use std::fs::{File, FileTimes, OpenOptions};
 use std::io::{Error, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use libc::{c_int, ENOSYS};
@@ -29,8 +33,9 @@ use crate::index::{CanonicalProjectName, Index};
 
 const ROOT_DIR: INode = (1 as u64).into();
 const ATTR_TTL: Duration = Duration::new(1, 0);
-// const TIMEOUT: Duration = Duration::new(1, 0);
-// const SLEEP_INTERVAL: Duration = Duration::new(0, 10);
+const PID_POLLING_INTERVAL: Duration = Duration::new(1, 0); // maybe too long?
+                                                            // const TIMEOUT: Duration = Duration::new(1, 0);
+                                                            // const SLEEP_INTERVAL: Duration = Duration::new(0, 10);
 
 pub struct NimbusFS {
     /// This where we store the nimbus files on disk
@@ -53,9 +58,9 @@ pub struct NimbusFS {
     file_ino_map: FxHashMap<PathBuf, INode>,
 
     /// Index locks
-    index: Arc<Mutex<Index>>,
-    /// Reference counting for the index locks (do we need atomic?)
-    index_refs: FxHashMap<CanonicalProjectName, u64>,
+    index: Arc<Mutex<Index>>, // maybe use channels
+    /// Reference counting for the project locks (do we need atomic?)
+    index_refs: FxHashMap<CanonicalProjectName, Arc<AtomicU64>>,
 
     /// Keep track of file handlers
     ino_open_file_handlers: FxHashMap<INode, Vec<IFileHandle>>,
@@ -112,27 +117,131 @@ impl NimbusFS {
             .into()
     }
 
-    pub fn inc_project_ref(&mut self, project: CanonicalProjectName) {
+    // Increment immediately, then decrement when/if cwd is outside of the project dir
+    pub fn pid_cwd_project_ref(&mut self, project: CanonicalProjectName, pid: u32) {
+        let counter = self.inc_project_ref(project.clone());
+        let mut full_cwd = self.mount_directory.clone();
+        full_cwd.push(project);
+        let index = self.index();
+        std::thread::spawn(move || {
+            // check cwd of pid
+            // we sleep twice the polling interval to make sure the kernel has time to update procfs (hacky!)
+            std::thread::sleep(PID_POLLING_INTERVAL);
+            match Process::new(pid as i32) {
+                Ok(process) => loop {
+                    std::thread::sleep(PID_POLLING_INTERVAL);
+                    match process.cwd() {
+                        Ok(cwd) => {
+                            if !cwd.starts_with(&full_cwd) {
+                                info!("left directory {:?}", full_cwd);
+                                break;
+                            }
+                        }
+                        Err(PermissionDenied(path)) => {
+                            error!(
+                                "permission denied to snoop on process {} for project {:?} at path {:?}",
+                                pid, full_cwd, path
+                                );
+                            break;
+                        }
+                        Err(NotFound(path)) => {
+                            info!("process not found at {:?}", path);
+                            break;
+                        }
+                        Err(Incomplete(path)) => {
+                            error!("proc file at {:?} has incomplete contents", path)
+                            // retry, todo: add retry counter so this function terminates upon repeated Incompletes
+                        }
+                        Err(Io(err, path)) => {
+                            error!("io error {:?} at {:?}", err, path);
+                            break;
+                        }
+                        Err(InternalError(err)) => {
+                            error!("internal error {:?}", err);
+                            break;
+                        }
+                        Err(Other(err)) => {
+                            error!("other error {:?}", err);
+                            break;
+                        }
+                    }
+                },
+                Err(PermissionDenied(path)) => error!(
+                    "permission denied to snoop on process {} for project {:?} at path {:?}",
+                    pid, full_cwd, path
+                ),
+                Err(NotFound(path)) => info!("process not found at {:?}", path),
+                Err(Incomplete(path)) => error!("proc file at {:?} has incomplete contents", path),
+                Err(Io(err, path)) => error!("io error {:?} at {:?}", err, path),
+                Err(InternalError(err)) => error!("internal error {:?}", err),
+                Err(Other(err)) => error!("other error {:?}", err),
+            };
+
+            // decrement
+            let prev = counter.fetch_sub(1, Ordering::SeqCst);
+            info!(
+                "project counter for {:?} was at {}, now at {}",
+                full_cwd,
+                prev,
+                prev - 1
+            );
+            if prev == 0 {
+                panic!("reference counting decrement failed/overflowed!");
+            } else if prev == 1 {
+                // acquire index lock, then check again to be safe
+                info!("should release project lock for {:?} now", full_cwd);
+                let acquired_index = index.lock().unwrap();
+                todo!();
+            }
+        });
+    }
+
+    pub fn inc_project_ref(&mut self, project: CanonicalProjectName) -> Arc<AtomicU64> {
         match self.index_refs.get_mut(&project) {
-            Some(mut inc) => *inc += 1,
+            Some(inc) => {
+                let prev = inc.fetch_add(1, Ordering::SeqCst);
+                info!(
+                    "project counter for {:?} was at {}, now at {}",
+                    project,
+                    prev,
+                    prev + 1
+                );
+                if prev == 0 {
+                    info!("should obtain project lock now")
+                    // acquire index lock, then check again to be safe
+                }
+                Arc::clone(inc)
+                // else if prev == MAX {
+                //     panic!("reference counting increment failed/overflowed!");
+                // }
+            }
             None => {
-                if self.index_refs.insert(project, 1).is_some() {
+                let inc = Arc::new(AtomicU64::new(1));
+                if self.index_refs.insert(project, Arc::clone(&inc)).is_some() {
                     panic!("should not happen");
                 };
+                inc
             }
         }
     }
 
-    pub fn dec_project_ref(&mut self, project: CanonicalProjectName) {
+    pub fn dec_project_ref(&mut self, project: CanonicalProjectName) -> Arc<AtomicU64> {
         match self.index_refs.get_mut(&project) {
-            Some(mut dec) => {
-                info!("project counter for {:?} is at {}", project, dec);
-                if *dec > 0 {
-                    *dec -= 1;
-                    info!("project counter for {:?} is *now* at {}", project, dec);
-                } else {
+            Some(dec) => {
+                let prev = dec.fetch_sub(1, Ordering::SeqCst);
+                info!(
+                    "project counter for {:?} was at {}, now at {}",
+                    project,
+                    prev,
+                    prev - 1
+                );
+                if prev == 0 {
                     panic!("reference counting decrement failed/overflowed!");
+                } else if prev == 1 {
+                    // acquire project lock first, then check again
+                    info!("should release project lock now");
                 }
+                Arc::clone(dec)
             }
             None => panic!("reference counting decrement failed!"),
         }
@@ -348,14 +457,16 @@ impl Fuse for NimbusFS {
 
     fn lookup_fs(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         parent: INode,
         name: &OsStr,
     ) -> std::io::Result<FileAttr> {
         info!("lookup: lookup called");
         let filename = self.parent_name_lookup_result(parent, name)?;
         info!("lookup: filename {:?}", filename);
+        self.pid_cwd_project_ref(self.canonicize_project_name(&filename), req.pid()); // this only really needs to happen on true lookups
         let ino = self.lookup_or_create_path(&filename);
+
         self.flush_associated_file_handlers(ino)?;
         let mut attr = self.getattr_path(&filename)?;
         attr.ino = ino.into();
